@@ -1,0 +1,14 @@
+# gitleaks config for Voxa.
+# Extends the default rules and allowlists the only historical finding: a
+# documented throwaway P-256 test key that lived in two old commits. It was never
+# a real APNs key and is no longer in the working tree (tests now generate the key
+# at runtime). These commit fingerprints keep a full-history scan clean.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Historical throwaway test key (dummy P-256, not a real credential)"
+commits = [
+  "af41c5c78178967af01722e3525451309e5da5af",
+  "32e11fdd760e13dfe654d6b5335e85483e970367",
+]

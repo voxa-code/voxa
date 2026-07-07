@@ -1,0 +1,35 @@
+# The `files` allowlist in package.json governs what is published.
+# This is belt-and-suspenders to keep dev cruft out of any included dir.
+
+# Dev / test / other surfaces
+tests/
+ios/
+web/
+docs/
+deploy/
+assets/
+server_cloud/
+.github/
+.agents/
+.superpowers/
+.playwright-mcp/
+.workflow-audit/
+
+# Python virtualenvs and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+.pytest_cache/
+
+# Node
+node_modules/
+
+# Root images and local env
+*.png
+.env
+.env.example
+.DS_Store
+devices.json
+pyproject.toml

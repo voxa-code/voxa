@@ -1,0 +1,33 @@
+# Publishes the npm package `voxa-code` when a GitHub Release is published.
+#
+# One-time setup (repo owner):
+#   Add a repository secret named NPM_TOKEN containing an npm "Automation"
+#   access token for an account with publish rights to `voxa-code`.
+#   (Settings -> Secrets and variables -> Actions -> New repository secret.)
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Least privilege: publishing only needs to read the repo; the npm auth is the
+# NPM_TOKEN secret, not the GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://registry.npmjs.org
+      - name: Show tarball contents
+        run: npm pack --dry-run
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

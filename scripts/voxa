@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# One command to run Voxa: starts the server + public tunnel and prints a
+# scannable QR in this terminal. Usage: ./scripts/voxa
+set -euo pipefail
+cd "$(dirname "$0")/.." || exit 1
+PY=".venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+exec "$PY" -u -m server.cli "$@"

@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voxa</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f0f0f;
+      color: #e8e8e8;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+      gap: 1.5rem;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #fff;
+    }
+
+    /* Status row */
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.95rem;
+      color: #aaa;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-disconnected { background: #555; }
+    .dot-connecting   { background: #f5a623; animation: pulse 1s infinite; }
+    .dot-connected    { background: #4caf50; }
+    .dot-error        { background: #f44336; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    /* Token input */
+    .token-wrap {
+      width: 100%;
+      max-width: 360px;
+    }
+
+    .token-wrap label {
+      display: block;
+      font-size: 0.78rem;
+      color: #888;
+      margin-bottom: 0.4rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    #token {
+      width: 100%;
+      padding: 0.65rem 0.9rem;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #1a1a1a;
+      color: #e8e8e8;
+      font-size: 1rem;
+      font-family: monospace;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    #token:focus { border-color: #555; }
+    #token:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #terminal {
+      width: 100%;
+      padding: 0.65rem 0.9rem;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #1a1a1a;
+      color: #e8e8e8;
+      font-size: 1rem;
+      outline: none;
+    }
+
+    /* Buttons */
+    .btn-row {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    button {
+      padding: 0.75rem 1.75rem;
+      border: none;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, background 0.15s;
+    }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    #connect-btn {
+      background: #3a7bd5;
+      color: #fff;
+      min-width: 130px;
+    }
+    #connect-btn:hover:not(:disabled) { background: #2f6ac5; }
+
+    #mute-btn {
+      background: #2a2a2a;
+      color: #ccc;
+      border: 1px solid #444;
+    }
+    #mute-btn:hover:not(:disabled) { background: #333; }
+    #mute-btn.muted {
+      background: #7b3a3a;
+      color: #ffcdd2;
+      border-color: #7b3a3a;
+    }
+
+    #stop-btn {
+      background: #2a2a2a;
+      color: #ffb4b4;
+      border: 1px solid #5a3a3a;
+    }
+    #stop-btn:hover:not(:disabled) { background: #3a2a2a; }
+
+    #terminals-btn { background: #2a2a2a; color: #cfe3ff; border: 1px solid #3a4a5a; }
+    #terminals-btn:hover:not(:disabled) { background: #2f3a47; }
+
+    #terminals {
+      width: 100%;
+      max-width: 360px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .term-item {
+      text-align: left;
+      padding: 0.6rem 0.8rem;
+      border-radius: 8px;
+      background: #161616;
+      border: 1px solid #2a2a2a;
+      color: #e8e8e8;
+      font-size: 0.9rem;
+    }
+    .term-item:hover:not(:disabled) { background: #1f2a36; border-color: #3a4a5a; }
+    .term-item .app { color: #6ab0ff; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    .term-item.uncontrollable { opacity: 0.5; }
+
+    /* Info text (working dir / mode) */
+    #info-text {
+      font-size: 0.8rem;
+      color: #666;
+      min-height: 1.2em;
+      text-align: center;
+      max-width: 360px;
+      word-break: break-all;
+    }
+
+    /* Live transcript / captions */
+    #transcript {
+      width: 100%;
+      max-width: 360px;
+      flex: 1 1 auto;
+      min-height: 120px;
+      max-height: 45dvh;
+      overflow-y: auto;
+      background: #161616;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      padding: 0.75rem 0.9rem;
+      font-size: 0.95rem;
+      line-height: 1.45;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    #transcript:empty::before {
+      content: "Captions will appear here…";
+      color: #555;
+      font-size: 0.85rem;
+    }
+    .line { display: flex; flex-direction: column; gap: 0.1rem; }
+    .line .who {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #777;
+    }
+    .line.agent .who { color: #6ab0ff; }
+    .line.user .who  { color: #7ed492; }
+    .line .said { color: #e8e8e8; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <div style="display:flex;align-items:center;gap:.6rem">
+    <img src="/static/voxa-mark-white.svg" alt="Voxa" style="width:40px;height:40px">
+    <h1>Voxa</h1>
+  </div>
+
+  <div class="status-row">
+    <span id="status-dot" class="dot dot-disconnected"></span>
+    <span id="status-text">Disconnected</span>
+  </div>
+
+  <div class="token-wrap">
+    <label for="token">Auth token</label>
+    <input id="token" type="password" placeholder="paste token here" autocomplete="off" spellcheck="false">
+  </div>
+
+  <div class="token-wrap">
+    <label for="folder">Working folder (optional — or just say it out loud)</label>
+    <input id="folder" type="text" placeholder="/Users/you/path/to/project" autocomplete="off" spellcheck="false" autocapitalize="off">
+  </div>
+
+  <div class="token-wrap">
+    <label for="terminal">Terminal app</label>
+    <select id="terminal">
+      <option value="auto">Auto-detect</option>
+      <option value="iTerm">iTerm2</option>
+      <option value="Terminal">Terminal</option>
+    </select>
+  </div>
+
+  <div class="btn-row">
+    <button id="connect-btn">Connect</button>
+    <button id="mute-btn" disabled>Mute</button>
+    <button id="stop-btn" disabled>Stop</button>
+    <button id="terminals-btn" disabled>Terminals</button>
+  </div>
+
+  <div id="terminals"></div>
+
+  <p id="info-text"></p>
+
+  <div id="transcript"></div>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

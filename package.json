@@ -1,0 +1,31 @@
+{
+  "name": "voxa-code",
+  "version": "0.1.103",
+  "description": "Voxa: a hands-free voice line to Claude Code. Run `npx voxa-code` to start the server, open a tunnel, and print a QR to pair your phone.",
+  "bin": { "voxa": "bin/voxa.js" },
+  "scripts": {
+    "prepack": "node -e \"const fs=require('fs'),p=require('path');(function w(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){if(!e.isDirectory())continue;const fp=p.join(d,e.name);if(e.name==='__pycache__')fs.rmSync(fp,{recursive:true,force:true});else w(fp)}})('server')\""
+  },
+  "files": [
+    "bin/",
+    "server/",
+    "static/",
+    "scripts/voxa",
+    "requirements.txt",
+    "README.md"
+  ],
+  "engines": { "node": ">=16" },
+  "keywords": ["claude", "voice", "cli", "agent"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ti-03/voxa.git"
+  },
+  "homepage": "https://voxa.space",
+  "bugs": {
+    "url": "https://github.com/Ti-03/voxa/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

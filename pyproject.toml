@@ -1,0 +1,74 @@
+[project]
+name = "voxa-code"
+version = "0.1.103"
+description = "Hands-free voice operator for Claude Code"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ti", email = "voxa@voxa.space" }]
+keywords = ["claude", "claude-code", "voice", "cli", "agent", "gemini"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12",
+    "google-genai>=0.3",
+    "claude-agent-sdk>=0.1",
+    "python-dotenv>=1.0",
+    "pyjwt[crypto]>=2.8",
+    "httpx[http2]>=0.27",
+    "qrcode>=7.4",
+    "cbor2>=5.6",
+    "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
+telemetry = ["sentry-sdk>=2"]
+
+[project.urls]
+Homepage = "https://voxa.space"
+Repository = "https://github.com/Ti-03/voxa"
+Issues = "https://github.com/Ti-03/voxa/issues"
+
+[project.scripts]
+voxa = "server.cli:main"
+# Alias matching the package name so `uvx voxa-code` / `pipx run voxa-code`
+# resolve without needing `--from voxa-code voxa`.
+voxa-code = "server.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# `static/` ships as a top-level data tree so that, once installed, it sits as a
+# sibling of the `server` package (site-packages/static/). server/app.py resolves
+# it via `Path(__file__).resolve().parent.parent / "static"`, i.e. relative to the
+# installed package, so it must live next to `server`, not inside it.
+packages = ["server", "static"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+static = ["**/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    # Third-party deprecation from Starlette's TestClient (recommends httpx2); not our code.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]

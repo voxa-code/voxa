@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12
+google-genai>=0.3
+claude-agent-sdk>=0.1
+python-dotenv>=1.0
+pyjwt[crypto]>=2.8
+httpx[http2]>=0.27
+qrcode>=7.4
+cbor2>=5.6
+pyobjc-framework-Quartz>=10; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10; sys_platform == "darwin"
