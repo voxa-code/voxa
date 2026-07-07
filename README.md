@@ -78,7 +78,7 @@ Full guide (including fully self-hosted mode, your own keys, no relay): [docs/RU
 
 **Is it open source?**
 
-Yes. Everything in this repo is [MIT](LICENSE): the laptop server, the iOS app, the phone web client, the marketing site, and the cloud pieces (relay + push). You can self-host all of it, or skip that entirely and use our already-hosted services: the default install connects to them out of the box.
+Everything in this repo is [MIT](LICENSE): the laptop server and the phone web client, everything you need to self-host with your own API key, no account required ([guide](docs/RUNNING.md)). The native iOS app and the hosted relay/push/billing service behind the zero-config install live in separate, proprietary repos, they power the hosted experience but aren't required to run Voxa yourself.
 
 **Is it free?**
 
