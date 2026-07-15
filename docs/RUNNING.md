@@ -9,7 +9,7 @@ this guide is for running a git checkout.
 ## One-time setup
 
 ```bash
-git clone https://github.com/Ti-03/voxa.git && cd voxa
+git clone https://github.com/voxa-code/voxa.git && cd voxa
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"     # installs the server + pyobjc (macOS) deps
 ```

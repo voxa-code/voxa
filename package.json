@@ -19,11 +19,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ti-03/voxa.git"
+    "url": "git+https://github.com/voxa-code/voxa.git"
   },
   "homepage": "https://voxa.space",
   "bugs": {
-    "url": "https://github.com/Ti-03/voxa/issues"
+    "url": "https://github.com/voxa-code/voxa/issues"
   },
   "publishConfig": {
     "access": "public"

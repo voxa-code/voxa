@@ -41,8 +41,8 @@ telemetry = ["sentry-sdk>=2"]
 
 [project.urls]
 Homepage = "https://voxa.space"
-Repository = "https://github.com/Ti-03/voxa"
-Issues = "https://github.com/Ti-03/voxa/issues"
+Repository = "https://github.com/voxa-code/voxa"
+Issues = "https://github.com/voxa-code/voxa/issues"
 
 [project.scripts]
 voxa = "server.cli:main"

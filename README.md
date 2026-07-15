@@ -67,7 +67,7 @@ phone ──── voice ────► laptop ────► Claude Code
 ## From source
 
 ```bash
-git clone https://github.com/Ti-03/voxa.git && cd voxa
+git clone https://github.com/voxa-code/voxa.git && cd voxa
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m server.cli
 ```

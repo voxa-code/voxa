@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and feature requests
+    url: https://github.com/voxa-code/voxa/discussions
+    about: Use Discussions for anything that isn't a confirmed bug.
+  - name: Security vulnerability
+    url: https://github.com/voxa-code/voxa/security/advisories/new
+    about: Please don't file public issues for exploitable bugs, see SECURITY.md.

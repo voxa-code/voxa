@@ -1,0 +1,49 @@
+name: Bug report
+description: Something in the server, CLI, or web client isn't working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security-relevant bugs (auth, relay trust, arbitrary command execution) should go through [SECURITY.md](../../SECURITY.md) instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Voxa version
+      description: Output of `voxa --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - install.sh / install.ps1
+        - npm
+        - uv / pip
+        - From source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / terminal output
+      render: shell
