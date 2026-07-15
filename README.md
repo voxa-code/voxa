@@ -7,7 +7,7 @@
 <p><strong>Talk to <a href="https://claude.com/claude-code">Claude Code</a> from anywhere.<br/>When it finishes, your phone rings.</strong></p>
 
 [![Website](https://img.shields.io/badge/voxa.space-black?style=flat-square&logo=safari&logoColor=white)](https://voxa.space)
-[![App Store](https://img.shields.io/badge/iPhone-App_Store-0D96F6?style=flat-square&logo=apple&logoColor=white)](https://voxa.space)
+[![App Store](https://img.shields.io/badge/iPhone-App_Store-0D96F6?style=flat-square&logo=apple&logoColor=white)](https://apps.apple.com/us/app/voxa-code/id6785221351)
 [![npm](https://img.shields.io/npm/v/voxa-code?style=flat-square&label=npm&color=CB3837)](https://www.npmjs.com/package/voxa-code)
 [![PyPI](https://img.shields.io/pypi/v/voxa-code?style=flat-square&label=PyPI&color=3775A9)](https://pypi.org/project/voxa-code/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
@@ -24,16 +24,10 @@
 
 Pick your way, same as [voxa.space/setup](https://voxa.space/setup):
 
-**macOS / Linux**
+**macOS**
 
 ```bash
 curl -fsSL https://voxa.space/install.sh | sh
-```
-
-**Windows (PowerShell)**
-
-```powershell
-irm https://voxa.space/install.ps1 | iex
 ```
 
 **npm**
@@ -48,9 +42,9 @@ npm install -g voxa-code
 uv tool install voxa-code
 ```
 
-Then run `voxa` on your laptop, scan the QR code with the **[Voxa iOS app](https://voxa.space)** (any phone browser works too), and start talking. Zero config, no API keys: voice runs through the hosted relay, terminal control never leaves your laptop.
+Then run `voxa` on your laptop, scan the QR code with the **[Voxa iOS app](https://apps.apple.com/us/app/voxa-code/id6785221351)** (any phone browser works too), and start talking. Zero config, no API keys: voice runs through the hosted relay, terminal control never leaves your laptop.
 
-**Requires:** [Claude Code](https://claude.com/claude-code) installed and logged in.
+**Requires:** [Claude Code](https://claude.com/claude-code) installed and logged in. Tested on macOS and iPhone only for now, see the platforms FAQ below.
 
 ## How it works
 
@@ -86,7 +80,7 @@ Self-hosting is free forever: run the server with your own API key, no relay nee
 
 **What platforms does it support?**
 
-The laptop side runs on macOS, Linux, and Windows. The phone side is the Voxa iPhone app, with any mobile browser as a fallback. Attaching to already-open GUI terminals (iTerm2, Terminal.app, Ghostty, Warp, VS Code) is macOS only; tmux attach works everywhere.
+Tested and supported today: the laptop server on macOS, paired with the [Voxa iPhone app](https://apps.apple.com/us/app/voxa-code/id6785221351) (any mobile browser works too). Windows, Linux, and Android are on the roadmap, along with support for other coding agents beyond Claude Code (Codex, etc.). Attaching to already-open GUI terminals (iTerm2, Terminal.app, Ghostty, Warp, VS Code) is macOS only; tmux attach works everywhere the server runs.
 
 ## Security
 
