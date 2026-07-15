@@ -46,35 +46,60 @@ def _text_of(content) -> str:
 
 
 def recap(cwd: str, max_msgs: int = 25, max_chars: int = 500,
-          projects_dir: str = PROJECTS_DIR) -> str:
+          projects_dir: str = PROJECTS_DIR, last_answer_chars: int = 3000) -> str:
     """Return a short text recap of the most recent conversation in ``cwd``'s
-    Claude session, or "" if there is no transcript."""
+    Claude session, or "" if there is no transcript.
+
+    Older messages are capped at ``max_chars`` each, but the FINAL assistant
+    message gets the much larger ``last_answer_chars`` budget: the recap rides
+    into the call that Claude's finish just triggered, and "what did it
+    actually say?" is answered by that last message, so it must arrive whole
+    (or nearly), not cut to a teaser.
+
+    Reads only the TAIL of the transcript (the last ~512KB): a long-running
+    session's JSONL grows to many megabytes, and json-parsing the whole file
+    for the last 25 messages held up every attach/answer for seconds. The
+    'This session started with' opener therefore comes from the earliest
+    message in the tail, not the literal first message of a huge session."""
     path = latest_transcript(cwd, projects_dir)
     if not path:
         return ""
     msgs: list[tuple[str, str]] = []
     try:
-        with open(path) as f:
-            for line in f:
-                try:
-                    o = json.loads(line)
-                except ValueError:
-                    continue
-                if o.get("type") not in ("user", "assistant"):
-                    continue
-                m = o.get("message") or {}
-                role = m.get("role") or o.get("type")
-                text = _text_of(m.get("content")).strip()
-                if text:
-                    msgs.append((role, text))
+        with open(path, "rb") as fb:
+            fb.seek(0, os.SEEK_END)
+            size = fb.tell()
+            tail = 512 * 1024
+            if size > tail:
+                fb.seek(size - tail)
+                fb.readline()   # drop the first (almost surely partial) line
+            else:
+                fb.seek(0)
+            raw = fb.read().decode("utf-8", errors="ignore")
+        for line in raw.splitlines():
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if o.get("type") not in ("user", "assistant"):
+                continue
+            m = o.get("message") or {}
+            role = m.get("role") or o.get("type")
+            text = _text_of(m.get("content")).strip()
+            if text:
+                msgs.append((role, text))
     except OSError:
         return ""
     if not msgs:
         return ""
+    recent = msgs[-max_msgs:]
+    last_assistant_i = next((i for i in range(len(recent) - 1, -1, -1)
+                             if recent[i][0] != "user"), None)
     lines = []
-    for role, text in msgs[-max_msgs:]:
-        if len(text) > max_chars:
-            text = text[:max_chars] + "…"
+    for i, (role, text) in enumerate(recent):
+        budget = last_answer_chars if i == last_assistant_i else max_chars
+        if len(text) > budget:
+            text = text[:budget] + "…"
         who = "You" if role == "user" else "Claude"
         lines.append(f"{who}: {text}")
     opener = next((t for r, t in msgs if r == "user"), "")

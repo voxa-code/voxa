@@ -44,9 +44,23 @@ async def test_send_is_nonblocking_and_accepts():
     orch, ctrl, _, _ = make()
     await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
     res = await orch.handle_tool_call("send_to_claude", {"text": "hi"})
-    assert res == {"accepted": True, "status": "working"}
+    assert res["accepted"] is True and res["status"] == "working"
+    assert "note" in res   # busy-mode guidance rides along in the tool result
     await asyncio.sleep(0)  # let the background task run
     assert ctrl.sent == ["hi"]
+
+
+async def test_send_refused_while_working():
+    # Busy guard: one task at a time. With the mic open while Claude works, Gemini
+    # may try a second dispatch; the orchestrator refuses it server-side and steers
+    # it to queue_task / stop_claude instead.
+    orch, ctrl, _, _ = make()
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
+    ctrl.status = "working"
+    res = await orch.handle_tool_call("send_to_claude", {"text": "again"})
+    assert res["error"] == "busy"
+    assert "queue_task" in res["hint"] and "stop_claude" in res["hint"]
+    assert ctrl.sent == []   # nothing reached the session
 
 async def test_final_text_is_spoken_and_notified():
     orch, ctrl, spoken, ui = make()
@@ -122,7 +136,7 @@ async def test_send_direct_emits_working_status_and_command_sent():
     orch, ctrl, _, ui = make()
     await orch.send_direct("hey")
     await asyncio.sleep(0)   # let the background send-and-report task run
-    assert {"type": "status", "status": "Claude working (mic paused)"} in ui
+    assert {"type": "status", "status": "Claude working"} in ui
     assert any(m.get("type") == "command_sent" and m.get("text") == "hey"
                for m in ui)
 
@@ -175,8 +189,37 @@ async def test_stop_cancels_in_flight_send():
     await orch.handle_tool_call("send_to_claude", {"text": "hi"})
     await asyncio.wait_for(started.wait(), 1)
     res = await orch.handle_tool_call("stop_claude", {})
-    assert res == {"status": "idle"}
+    assert res["status"] == "interrupted"
     await asyncio.wait_for(cancelled.wait(), 1)
+
+
+async def test_stop_prefers_interrupt_and_keeps_session():
+    # stop_claude must interrupt the current run WITHOUT tearing the session down:
+    # a controller exposing interrupt() gets that (session stays driveable), and
+    # the destructive stop() is never called.
+    class InterruptibleController(FakeController):
+        def __init__(self):
+            super().__init__()
+            self.interrupts = 0
+            self.stops = 0
+        async def interrupt(self):
+            self.interrupts += 1
+            self.status = "idle"
+        async def stop(self):
+            self.stops += 1
+            self.status = "idle"
+
+    orch, ctrl, _, _ = make(InterruptibleController())
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
+    ctrl.status = "working"
+    res = await orch.handle_tool_call("stop_claude", {})
+    assert res["status"] == "interrupted"
+    assert ctrl.interrupts == 1 and ctrl.stops == 0
+    # The session is still driveable: a follow-up dispatch is accepted.
+    r = await orch.handle_tool_call("send_to_claude", {"text": "do this instead"})
+    assert r.get("accepted") is True
+    await asyncio.sleep(0)
+    assert ctrl.sent == ["do this instead"]
 
 
 async def test_set_working_dir_error_suggests_siblings(tmp_path):
@@ -508,10 +551,10 @@ async def test_resolve_approval_without_pending_reports_error():
 
 
 async def test_resolve_approval_after_swap_refuses():
-    # A prompt raised in /p/A must not be actuated once the driven pane has
-    # swapped to /p/B (mid-call attach_terminal): pressing now would type into
-    # a DIFFERENT live terminal than the one that asked. Mirrors ws_session.py's
-    # approval_decision guard, applied to the voice path.
+    # A prompt raised in /p/A whose terminal can no longer be attached must not
+    # be actuated from a pane driving /p/B: pressing would type into a
+    # DIFFERENT live terminal than the one that asked. (When the attach
+    # SUCCEEDS the foreign prompt is answerable; see the test below.)
     orch, ctrl, _, _ = make()
     from server.approvals import ApprovalStore, build_approval
     st = ApprovalStore()
@@ -519,6 +562,9 @@ async def test_resolve_approval_after_swap_refuses():
     st.put(a)
     orch.approvals = st
     ctrl.working_dir = "/p/B"
+    async def fake_attach(cwd):
+        return {"error": "source terminal not open or not discoverable"}
+    orch.attach_source = fake_attach
     pressed = []
     async def fake_press(k):
         pressed.append(k)
@@ -528,6 +574,35 @@ async def test_resolve_approval_after_swap_refuses():
     assert pressed == []
     assert "error" in res
     assert st.get(a["approval_id"]) is not None   # left untouched, not resolved
+
+
+async def test_resolve_approval_attaches_to_foreign_prompt_and_presses():
+    # The user answers a menu that rang from a session Voxa is NOT driving
+    # (fleet reality): resolve_approval falls back to the latest approval,
+    # attaches to ITS terminal first, then presses into the right pane.
+    orch, ctrl, _, _ = make()
+    from server.approvals import ApprovalStore, build_approval
+    st = ApprovalStore()
+    a = build_approval("/p/trailer", "pick a style",
+                       "> 1. Bold pictograms\n  2. Phone POV\n  3. Kinetic type")
+    st.put(a)
+    orch.approvals = st
+    ctrl.working_dir = "/p/loop"          # driving a different session
+    attached = []
+    async def fake_attach(cwd):
+        attached.append(cwd)
+        return {"attached": True}
+    orch.attach_source = fake_attach
+    pressed = []
+    async def fake_press(k):
+        pressed.append(k)
+        return {"pressed": k}
+    orch.press_key = fake_press
+    res = await orch.handle_tool_call("resolve_approval", {"decision": "2"})
+    assert attached == ["/p/trailer"]
+    assert pressed == ["2"]
+    assert res["resolved"] == "2"
+    assert st.latest() is None            # resolved and cleared
 
 
 async def test_resolve_approval_notifies_phone_when_wired():
@@ -557,6 +632,85 @@ async def test_resolve_approval_notifies_phone_when_wired():
     res = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
     assert res["resolved"] == "1"
     assert resolved_ids == [a["approval_id"]]
+
+
+# --- resolve_approval must not claim success when the press itself failed ------
+# (the phantom-approval bug: AXController had no press(), so the bare
+# `await self.press_key(key)` in resolve_approval ignored the error dict,
+# resolved the card, and told the voice agent "selected" when nothing moved).
+
+
+async def test_resolve_approval_press_error_leaves_approval_active_and_reports_it():
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = "/p/loop"
+    from server.approvals import ApprovalStore, build_approval
+    st = ApprovalStore()
+    a = build_approval("/p/loop", "s", "> 1. Yes\n  2. No")
+    st.put(a)
+    orch.approvals = st
+
+    async def fake_press(k):
+        return {"error": "press not supported"}
+    orch.press_key = fake_press
+
+    res = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
+    assert "error" in res
+    assert "still waiting" in res["error"]
+    assert "press not supported" in res["error"]
+    # Left ACTIVE, not resolved: a real selection never reached the pane.
+    assert st.get(a["approval_id"]) is not None
+
+
+async def test_resolve_approval_controller_without_press_leaves_approval_active():
+    # No fake press_key here: exercises the real Orchestrator.press_key path
+    # against a controller with no press() method at all (AXController before
+    # the fix), same as ws_session's tap-path guard already does.
+    class NoPress(FakeController):
+        def __init__(self):
+            super().__init__()
+            self._started = True
+
+    ctrl = NoPress()
+    ctrl.working_dir = "/p/loop"
+    orch, _, _, _ = make(ctrl)
+    from server.approvals import ApprovalStore, build_approval
+    st = ApprovalStore()
+    a = build_approval("/p/loop", "s", "> 1. Yes\n  2. No")
+    st.put(a)
+    orch.approvals = st
+
+    res = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
+    assert "error" in res and "still waiting" in res["error"]
+    assert st.get(a["approval_id"]) is not None
+
+
+async def test_resolve_approval_retry_after_press_recovers_then_resolves():
+    # Once the underlying press starts working, a follow-up resolve_approval
+    # (the user retrying the same decision) succeeds and resolves normally.
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = "/p/loop"
+    from server.approvals import ApprovalStore, build_approval
+    st = ApprovalStore()
+    a = build_approval("/p/loop", "s", "> 1. Yes\n  2. No")
+    st.put(a)
+    orch.approvals = st
+
+    calls = {"n": 0}
+
+    async def fake_press(k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"error": "no_session"}
+        return {"pressed": k}
+    orch.press_key = fake_press
+
+    res1 = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
+    assert "error" in res1
+    assert st.get(a["approval_id"]) is not None   # still active after the failure
+
+    res2 = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
+    assert res2["resolved"] == "1"
+    assert st.latest() is None                    # resolved on the successful retry
 
 
 # --- fleet tools: list_sessions / switch_session / new_session -------------------
@@ -808,6 +962,9 @@ async def test_new_session_failed_start_rearms_previous_session(tmp_path, monkey
     assert orch.controller is a
     assert a.reattach_calls == 1 and a._started is True
     # And it actually accepts input (the regression: no_session before the re-arm).
+    # (Idle first: the busy guard would refuse a dispatch while status=="working",
+    # and this test only checks the re-arm.)
+    a.status = "idle"
     r = await orch.handle_tool_call("send_to_claude", {"text": "still works"})
     assert "error" not in r
     await asyncio.gather(*list(orch._bg), return_exceptions=True)
@@ -1024,7 +1181,7 @@ async def test_stop_flushes_queue_with_count(tmp_path):
     await asyncio.sleep(0)
     await orch.handle_tool_call("queue_task", {"text": "do B"})
     res = await orch.handle_tool_call("stop_claude", {})
-    assert res["status"] == "idle"
+    assert res["status"] == "interrupted"
     assert res["dropped"] == 2                            # running + queued dropped
     assert orch.queue.items("/p/loop") == []
     assert "/p/loop" not in orch.notifier.queue_active_cwds
@@ -1036,7 +1193,7 @@ async def test_queue_task_without_queue_falls_back_to_send(tmp_path):
     ctrl._started = True
     ctrl.working_dir = "/p/loop"
     res = await orch.handle_tool_call("queue_task", {"text": "do A"})
-    assert res == {"accepted": True, "status": "working"}
+    assert res["accepted"] is True and res["status"] == "working"
     await asyncio.sleep(0)
     assert ctrl.sent == ["do A"]
 
@@ -1054,30 +1211,6 @@ async def test_queue_remove_and_move_push_updates(tmp_path):
     assert "do B" not in texts and texts == ["do A", "do C"]
     # A task_queue push followed each mutation.
     assert sum(1 for m in ui if m.get("type") == "task_queue") >= 3
-
-
-async def test_queue_engaged_reflects_queue_and_status(tmp_path):
-    # The mic-gate signal (Task 3): the line stays open while idle no matter what,
-    # and while WORKING only when the driven cwd has a non-empty queue. Working with
-    # an empty queue keeps today's cost-saving pause.
-    orch, ctrl, _, _, _ = make_queued(tmp_path)
-    ctrl.status = "idle"
-    assert orch.queue_engaged is True             # idle: mic always open
-    ctrl.status = "working"
-    assert orch.queue_engaged is False            # working + empty queue -> paused
-    orch.queue.add("/p/loop", "later item")
-    assert orch.queue_engaged is True             # working + queued -> mic stays open
-
-
-def test_queue_engaged_without_queue_pauses_while_working():
-    # A bare orchestrator (no queue wired) keeps the mic paused while working, so a
-    # non-queue user's cost profile is byte-identical to today.
-    orch, ctrl, _, _ = make()
-    ctrl.working_dir = "/p/loop"
-    ctrl.status = "working"
-    assert orch.queue_engaged is False
-    ctrl.status = "idle"
-    assert orch.queue_engaged is True
 
 
 async def test_swapping_controller_ends_an_active_burst(tmp_path):
@@ -1270,16 +1403,14 @@ async def test_git_commit_pushes_card_to_phone_when_line_attached(monkeypatch):
     assert cards[0]["approval_id"] == res["pending_approval"]
 
 
-async def test_resolve_approval_git_yes_runs_action_not_keypress(monkeypatch):
-    import server.git_ops as git_ops
-    committed = []
-    monkeypatch.setattr(
-        git_ops, "git_commit",
-        lambda cwd, m: committed.append((cwd, m)) or
-        {"summary": "Committed on main: m.", "branch": "main"})
+async def test_resolve_approval_git_yes_runs_action_not_keypress():
+    # A confirmed git approval dispatches the action into the visible session
+    # (Option A) rather than pressing a key into the pane; the pane is never
+    # touched, and the card is cleared.
     from server.approvals import ApprovalStore, build_action_approval
     orch, ctrl, _, _ = make()
     ctrl.working_dir = "/p/loop"
+    ctrl._started = True
     st = ApprovalStore()
     a = build_action_approval("/p/loop", "Commit 1 change(s) on main: m",
                               tool="git_commit",
@@ -1295,9 +1426,10 @@ async def test_resolve_approval_git_yes_runs_action_not_keypress(monkeypatch):
 
     orch.press_key = fake_press
     res = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
-    assert committed == [("/p/loop", "m")]
+    await asyncio.gather(*list(orch._bg), return_exceptions=True)
+    assert ctrl.sent and "git" in ctrl.sent[0].lower() and "m" in ctrl.sent[0]
     assert pressed == []                    # a git approval never touches a pane
-    assert res["summary"].startswith("Committed")
+    assert "terminal" in res["summary"]
     assert st.get(a["approval_id"]) is None
 
 
@@ -1357,37 +1489,261 @@ async def test_resolve_approval_git_respects_cwd_guard():
     assert st.get(a["approval_id"]) is not None
 
 
-async def test_execute_approved_action_commit_then_push(monkeypatch):
-    import server.git_ops as git_ops
-    monkeypatch.setattr(git_ops, "git_commit",
-                        lambda cwd, m: {"summary": "Committed on main: m.",
-                                        "branch": "main"})
-    monkeypatch.setattr(git_ops, "git_push",
-                        lambda cwd: {"summary": "Pushed main to origin/main.",
-                                     "branch": "main"})
-    orch, _, _, _ = make()
+async def test_execute_approved_action_commit_then_push_runs_in_terminal():
+    # Option A: a confirmed commit(+push) is dispatched to the VISIBLE Claude
+    # session (so the user watches it happen), not run as a hidden subprocess.
+    orch, ctrl, _, _ = make()
+    ctrl._started = True
     res = await orch.execute_approved_action(
-        {"action": {"kind": "git_commit", "cwd": "/p/loop", "message": "m",
+        {"action": {"kind": "git_commit", "cwd": "/p/loop", "message": "fix bug",
                     "push": True}})
-    assert "Committed" in res["summary"] and "Pushed" in res["summary"]
-    assert "error" not in res
+    await asyncio.gather(*list(orch._bg), return_exceptions=True)
+    assert len(ctrl.sent) == 1                          # one git-only instruction
+    instr = ctrl.sent[0].lower()
+    assert "git" in instr and "fix bug" in ctrl.sent[0] and "push" in instr
+    assert "terminal" in res["summary"]                 # spoken ack, real result relays later
 
 
-async def test_execute_approved_action_push_failure_after_commit(monkeypatch):
-    import server.git_ops as git_ops
-    monkeypatch.setattr(git_ops, "git_commit",
-                        lambda cwd, m: {"summary": "Committed on main: m.",
-                                        "branch": "main"})
-    monkeypatch.setattr(git_ops, "git_push",
-                        lambda cwd: {"error": "Push failed: rejected."})
-    orch, _, _, _ = make()
+async def test_execute_approved_action_push_only_runs_in_terminal():
+    orch, ctrl, _, _ = make()
+    ctrl._started = True
     res = await orch.execute_approved_action(
-        {"action": {"kind": "git_commit", "cwd": "/p/loop", "message": "m",
-                    "push": True}})
-    assert "Committed" in res["error"] and "Push failed" in res["error"]
+        {"action": {"kind": "git_push", "cwd": "/p/loop"}})
+    await asyncio.gather(*list(orch._bg), return_exceptions=True)
+    assert len(ctrl.sent) == 1
+    instr = ctrl.sent[0].lower()
+    assert "push" in instr and "commit" not in instr.split("do not")[0]
+    assert "terminal" in res["summary"]
 
 
 async def test_execute_approved_action_unknown_kind():
     orch, _, _, _ = make()
     res = await orch.execute_approved_action({"action": {"kind": "rm_rf"}})
     assert "error" in res
+
+
+# --- danger gate: send_to_claude / queue_task -------------------------------
+
+async def test_send_to_claude_dangerous_text_offers_approval_and_does_not_dispatch():
+    from server.approvals import ApprovalStore
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = "/p/loop"
+    orch.approvals = ApprovalStore()
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/p/loop"})
+    res = await orch.handle_tool_call("send_to_claude", {"text": "rm -rf /tmp/build"})
+    assert "pending_approval" in res
+    assert "Careful" in res["summary"] and "rm -rf" in res["summary"]
+    await asyncio.sleep(0)
+    assert ctrl.sent == []                          # nothing dispatched yet
+    a = orch.approvals.active_for("/p/loop")
+    assert a is not None
+    assert a["tool"] == "dangerous_command"
+    assert a["action"] == {"kind": "dangerous_send", "cwd": "/p/loop",
+                           "text": "rm -rf /tmp/build", "via": "send_to_claude"}
+
+
+async def test_send_to_claude_safe_text_dispatches_immediately():
+    orch, ctrl, _, _ = make()
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/p/loop"})
+    res = await orch.handle_tool_call("send_to_claude", {"text": "add a login page"})
+    assert res["accepted"] is True
+    await asyncio.sleep(0)
+    assert ctrl.sent == ["add a login page"]
+
+
+async def test_resolve_approval_yes_dispatches_dangerous_send_to_claude_text():
+    from server.approvals import ApprovalStore, build_action_approval
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = "/p/loop"
+    ctrl._started = True
+    st = ApprovalStore()
+    a = build_action_approval(
+        "/p/loop", "Careful: this recursively deletes files. Run it? rm -rf /tmp/build",
+        tool="dangerous_command",
+        action={"kind": "dangerous_send", "cwd": "/p/loop",
+                "text": "rm -rf /tmp/build", "via": "send_to_claude"})
+    st.put(a)
+    orch.approvals = st
+    res = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
+    assert res["summary"] == "Okay, running it."
+    await asyncio.sleep(0)
+    assert ctrl.sent == ["rm -rf /tmp/build"]
+    assert st.get(a["approval_id"]) is None
+
+
+async def test_resolve_approval_no_declines_dangerous_send_without_dispatch():
+    from server.approvals import ApprovalStore, build_action_approval
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = "/p/loop"
+    st = ApprovalStore()
+    a = build_action_approval(
+        "/p/loop", "Careful: this recursively deletes files. Run it? rm -rf /tmp/build",
+        tool="dangerous_command",
+        action={"kind": "dangerous_send", "cwd": "/p/loop",
+                "text": "rm -rf /tmp/build", "via": "send_to_claude"})
+    st.put(a)
+    orch.approvals = st
+    res = await orch.handle_tool_call("resolve_approval", {"decision": "no"})
+    assert res.get("declined") is True
+    await asyncio.sleep(0)
+    assert ctrl.sent == []
+    assert st.get(a["approval_id"]) is None
+
+
+async def test_send_to_claude_confirmed_true_bypasses_danger_gate():
+    from server.approvals import ApprovalStore
+    orch, ctrl, _, _ = make()
+    orch.approvals = ApprovalStore()
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/p/loop"})
+    res = await orch.handle_tool_call(
+        "send_to_claude", {"text": "rm -rf /tmp/build", "confirmed": True})
+    assert res["accepted"] is True
+    await asyncio.sleep(0)
+    assert ctrl.sent == ["rm -rf /tmp/build"]
+    assert orch.approvals.active_for("/p/loop") is None
+
+
+async def test_queue_task_dangerous_text_offers_approval(tmp_path):
+    from server.approvals import ApprovalStore
+    orch, ctrl, _, ui, _ = make_queued(tmp_path)
+    orch.approvals = ApprovalStore()
+    res = await orch.handle_tool_call("queue_task", {"text": "git push --force"})
+    assert "pending_approval" in res
+    a = orch.approvals.active_for("/p/loop")
+    assert a["action"] == {"kind": "dangerous_send", "cwd": "/p/loop",
+                           "text": "git push --force", "via": "queue_task"}
+    assert orch.queue.items("/p/loop") == []        # never enqueued
+    assert ctrl.sent == []
+
+
+async def test_resolve_approval_yes_dispatches_dangerous_queue_task_text(tmp_path):
+    from server.approvals import ApprovalStore, build_action_approval
+    orch, ctrl, _, ui, _ = make_queued(tmp_path)
+    st = ApprovalStore()
+    a = build_action_approval(
+        "/p/loop", "Careful: this force-pushes over remote history. Run it? git push --force",
+        tool="dangerous_command",
+        action={"kind": "dangerous_send", "cwd": "/p/loop",
+                "text": "git push --force", "via": "queue_task"})
+    st.put(a)
+    orch.approvals = st
+    res = await orch.handle_tool_call("resolve_approval", {"decision": "yes"})
+    assert "error" not in res
+    await asyncio.sleep(0)
+    assert ctrl.sent == ["git push --force"]         # dispatched via queue_task(confirmed=True)
+
+
+async def test_queue_task_confirmed_true_bypasses_danger_gate(tmp_path):
+    orch, ctrl, _, ui, _ = make_queued(tmp_path)
+    res = await orch.handle_tool_call(
+        "queue_task", {"text": "git push --force", "confirmed": True})
+    assert res == {"accepted": True, "queued": False}
+    await asyncio.sleep(0)
+    assert ctrl.sent == ["git push --force"]
+
+
+# --- get_cost tool -----------------------------------------------------------
+
+async def test_get_cost_reads_driven_cwd(monkeypatch):
+    import server.cost as cost_mod
+    calls = []
+
+    def fake(cwd):
+        calls.append(cwd)
+        return {"input_tokens": 100, "output_tokens": 50, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "total_tokens": 150, "cost_usd": 0.0015,
+                "by_model": {}, "messages": 3}
+
+    monkeypatch.setattr(cost_mod, "session_cost", fake)
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = "/p/loop"
+    res = await orch.handle_tool_call("get_cost", {})
+    assert calls == ["/p/loop"]
+    assert res["cost_usd"] == 0.0015
+    assert res["total_tokens"] == 150
+
+
+async def test_get_cost_requires_a_session_folder():
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = None
+    res = await orch.handle_tool_call("get_cost", {})
+    assert res == {"error": "No session folder is open; open or attach one first."}
+
+
+async def test_get_cost_empty_working_dir_string_also_errors():
+    orch, ctrl, _, _ = make()
+    ctrl.working_dir = ""
+    res = await orch.handle_tool_call("get_cost", {})
+    assert "error" in res
+
+
+async def test_take_screenshot_notifies_with_image(monkeypatch):
+    from server import screenshot as screenshot_module
+    async def fake_capture():
+        return {"image": "ZmFrZQ=="}
+    monkeypatch.setattr(screenshot_module, "capture_screenshot", fake_capture)
+
+    orch, _, _, ui = make()
+    res = await orch.handle_tool_call("take_screenshot", {})
+
+    assert res == {"status": "sent"}
+    assert ui == [{"type": "screenshot", "image": "ZmFrZQ=="}]
+
+
+async def test_take_screenshot_notifies_with_error(monkeypatch):
+    from server import screenshot as screenshot_module
+    async def fake_capture():
+        return {"error": "Screen Recording permission not granted."}
+    monkeypatch.setattr(screenshot_module, "capture_screenshot", fake_capture)
+
+    orch, _, _, ui = make()
+    res = await orch.handle_tool_call("take_screenshot", {})
+
+    assert res == {"error": "Screen Recording permission not granted."}
+    assert ui == [{"type": "screenshot", "error": "Screen Recording permission not granted."}]
+
+
+# --- verify-on-read busy guard: a stale "working" flag must heal, not refuse --
+
+class _VerifyController(FakeController):
+    """A controller stuck on status='working' whose live pane says idle."""
+
+    def __init__(self, still_working: bool):
+        super().__init__()
+        self._still = still_working
+        self.verified = 0
+
+    async def verify_working(self) -> bool:
+        self.verified += 1
+        if not self._still:
+            self.status = "idle"
+        return self._still
+
+
+async def test_send_dispatches_when_stale_busy_flag_verifies_idle():
+    orch, ctrl, _, _ = make(_VerifyController(still_working=False))
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
+    ctrl.status = "working"          # wedged flag, but the pane is idle
+    res = await orch.handle_tool_call("send_to_claude", {"text": "go"})
+    assert res.get("accepted") is True
+    assert ctrl.verified == 1
+    import asyncio as _a
+    await _a.sleep(0)
+    assert ctrl.sent == ["go"]
+
+
+async def test_send_still_refused_when_verification_confirms_busy():
+    orch, ctrl, _, _ = make(_VerifyController(still_working=True))
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
+    ctrl.status = "working"
+    res = await orch.handle_tool_call("send_to_claude", {"text": "again"})
+    assert res["error"] == "busy"
+    assert ctrl.sent == []
+
+
+async def test_get_claude_status_heals_stale_flag():
+    orch, ctrl, _, _ = make(_VerifyController(still_working=False))
+    await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
+    ctrl.status = "working"
+    res = await orch.handle_tool_call("get_claude_status", {})
+    assert res["status"] == "idle"   # answered from the live pane, flag healed

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -89,12 +90,18 @@ class CallManager:
         self._seq += 1
         call_id = f"call-{self._seq}"
         self._last_call_id[account or ""] = call_id
-        for token in self._registry.tokens(account):
+
+        # Push every registered token at once instead of one after another: a
+        # fleet with several phones must not wait N x (TLS+APNs round trip) to
+        # ring the last one. Per-token failure handling is unchanged, just
+        # fanned out under gather so one slow/raising token never delays (or
+        # blocks) the others.
+        async def _push(token: str) -> None:
             try:
                 res = await self._pusher.send_voip(token, call_id, summary, approval=approval)
             except Exception:
                 logger.exception("voip push raised for token %s", token[:8])
-                continue
+                return
             if res is not True:
                 logger.warning("voip push rejected for token %s (call %s, status %s)",
                                token[:8], call_id, res)
@@ -102,6 +109,8 @@ class CallManager:
                 # Prune it so we stop ringing a phone that will never answer.
                 if res == 410 and hasattr(self._registry, "remove"):
                     self._registry.remove(token)
+
+        await asyncio.gather(*(_push(t) for t in self._registry.tokens(account)))
 
     def last_call_id(self, account: str | None = None) -> str | None:
         return self._last_call_id.get(account or "")

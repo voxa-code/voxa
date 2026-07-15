@@ -29,11 +29,13 @@ events.jsonl
 sessions.jsonl
 actual_cost.json
 attested.json
+call_meter.json
 last_session.json
 last_session.json.tmp
 deploy/secrets.local.env
 
 .superpowers/
+.worktrees/
 
 # Node dependencies (never commit)
 node_modules/
@@ -48,3 +50,7 @@ appstore-screenshots/
 /*.png
 /*.jpg
 /*.jpeg
+
+# graphify (cloned tool source + generated knowledge graph)
+/graphify/
+/graphify-out/

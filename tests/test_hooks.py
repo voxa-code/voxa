@@ -3,6 +3,7 @@ import json
 from server.hooks import (
     last_assistant_text, route_hook, merge_hook, remove_hook,
     install_claude_hook, uninstall_claude_hook, hook_command, MARKER, HOOK_EVENTS,
+    pre_tool_command_text, pre_tool_deny_response,
 )
 
 
@@ -172,3 +173,142 @@ def test_hook_command_is_exit_safe_and_marked():
     assert "curl" in cmd and "--data-binary @-" in cmd
     assert "; true" in cmd            # never blocks Claude if the server is down
     assert MARKER in cmd              # identifiable for idempotent install
+
+
+# --- per-event hook command shape ----------------------------------------------
+
+def test_hook_command_no_event_swallows_stdout_and_stderr():
+    # Backward compatible default (no event arg) stays byte-identical to the
+    # original fire-and-forget form.
+    cmd = hook_command("http://127.0.0.1:8787/hook?token=t")
+    assert cmd == (
+        "curl -s -m 5 -X POST 'http://127.0.0.1:8787/hook?token=t' "
+        "-H 'Content-Type: application/json' --data-binary @- >/dev/null 2>&1 "
+        f"; true  # {MARKER}"
+    )
+
+
+def test_hook_command_stop_notification_userpromptsubmit_swallow_stdout():
+    # These three MUST be byte-identical to the original command: UserPromptSubmit
+    # especially must keep swallowing stdout since Claude Code injects that hook's
+    # stdout into context.
+    expected = (
+        "curl -s -m 5 -X POST 'http://127.0.0.1:8787/hook?token=t' "
+        "-H 'Content-Type: application/json' --data-binary @- >/dev/null 2>&1 "
+        f"; true  # {MARKER}"
+    )
+    for event in ("Stop", "Notification", "UserPromptSubmit"):
+        assert hook_command("http://127.0.0.1:8787/hook?token=t", event) == expected
+
+
+def test_hook_command_pretooluse_preserves_stdout():
+    cmd = hook_command("http://127.0.0.1:8787/hook?token=t", "PreToolUse")
+    assert cmd == (
+        "curl -s -m 5 -X POST 'http://127.0.0.1:8787/hook?token=t' "
+        "-H 'Content-Type: application/json' --data-binary @- 2>/dev/null "
+        f"; true  # {MARKER}"
+    )
+    assert "@- 2>/dev/null" in cmd    # stdout stays connected so a deny can reach Claude
+    assert "@- >/dev/null" not in cmd
+    assert "; true" in cmd            # decision comes from the JSON body, not exit code
+
+
+def test_merge_hook_installs_per_event_commands():
+    settings = merge_hook({}, "http://127.0.0.1:8787/hook?token=t")
+    pre_tool_cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert pre_tool_cmd == hook_command("http://127.0.0.1:8787/hook?token=t", "PreToolUse")
+    assert stop_cmd == hook_command("http://127.0.0.1:8787/hook?token=t", "Stop")
+    assert pre_tool_cmd != stop_cmd
+    for event in ("Notification", "UserPromptSubmit"):
+        cmd = settings["hooks"][event][0]["hooks"][0]["command"]
+        assert cmd == stop_cmd
+
+
+# --- PreToolUse danger gate -----------------------------------------------------
+
+def test_pre_tool_command_text_from_dict_input():
+    body = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
+    assert pre_tool_command_text(body) == "rm -rf /"
+
+
+def test_pre_tool_command_text_from_dict_without_command_key():
+    body = {"tool_name": "Other", "tool_input": {"foo": "bar"}}
+    assert pre_tool_command_text(body) == "{'foo': 'bar'}"
+
+
+def test_pre_tool_command_text_from_string_input():
+    body = {"tool_name": "Bash", "tool_input": "rm -rf /"}
+    assert pre_tool_command_text(body) == "rm -rf /"
+
+
+def test_pre_tool_command_text_missing_input_is_empty():
+    assert pre_tool_command_text({"tool_name": "Bash"}) == ""
+
+
+def test_pre_tool_deny_response_for_dangerous_command():
+    body = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
+    deny = pre_tool_deny_response(body)
+    assert deny == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Voxa blocked this: recursively deletes files. "
+                "It recursively deletes files; ask the user to confirm before running it."
+            ),
+        }
+    }
+
+
+def test_pre_tool_deny_response_for_force_push():
+    body = {"tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}}
+    deny = pre_tool_deny_response(body)
+    assert deny["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "force-pushes over remote history" in (
+        deny["hookSpecificOutput"]["permissionDecisionReason"])
+
+
+def test_pre_tool_deny_response_none_for_safe_command():
+    body = {"tool_name": "Bash", "tool_input": {"command": "ls -la"}}
+    assert pre_tool_deny_response(body) is None
+
+
+def test_pre_tool_deny_response_none_for_missing_command():
+    assert pre_tool_deny_response({"tool_name": "Bash", "tool_input": {}}) is None
+
+
+# --- others_mid_turn / drain_held_finishes: one call at the END of a fleet -----
+
+from server.hooks import others_mid_turn, drain_held_finishes
+
+
+def test_others_mid_turn_true_when_another_session_is_open():
+    turns = {"a": 100.0, "b": 150.0}
+    assert others_mid_turn(turns, "a", now=200.0, max_age=3600) is True
+
+
+def test_others_mid_turn_false_when_only_self_is_open():
+    turns = {"a": 100.0}
+    assert others_mid_turn(turns, "a", now=200.0, max_age=3600) is False
+    assert others_mid_turn({}, "a", now=200.0, max_age=3600) is False
+
+
+def test_others_mid_turn_prunes_stale_entries():
+    # A session killed mid-turn must not silence finish rings forever.
+    turns = {"dead": 0.0, "self": 5000.0}
+    assert others_mid_turn(turns, "self", now=5000.0, max_age=3600) is False
+    assert "dead" not in turns
+
+
+def test_drain_held_finishes_combines_and_clears():
+    held = {"s1": ("loop finished: tests green", "/p/loop"),
+            "s2": ("dorak finished", "/p/dorak")}
+    out = drain_held_finishes(held, "veil finished: shipped it")
+    assert out.startswith("All tasks are done. veil finished: shipped it. Earlier: ")
+    assert "loop finished: tests green" in out and "dorak finished" in out
+    assert held == {}
+
+
+def test_drain_held_finishes_noop_when_nothing_held():
+    assert drain_held_finishes({}, "loop finished") == "loop finished"

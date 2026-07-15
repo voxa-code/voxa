@@ -1,5 +1,9 @@
+import time
+
+from google.genai import types
+
 from server.config import Config
-from server.gemini_operator import TOOL_DECLARATIONS, GeminiOperator
+from server.gemini_operator import TOOL_DECLARATIONS, GeminiOperator, barge_in_enabled
 
 
 def _cfg():
@@ -147,6 +151,14 @@ def test_fleet_tool_declarations():
     assert new["required"] == ["path"]
 
 
+def test_take_screenshot_declaration_present():
+    # take_screenshot must match orchestrator.handle_tool_call's name exactly and
+    # take no parameters, or Gemini's call would silently miss the handler.
+    decls = {d["name"]: d for d in TOOL_DECLARATIONS}
+    assert "take_screenshot" in decls
+    assert decls["take_screenshot"]["parameters"]["properties"] == {}
+
+
 def test_queue_task_declaration_present():
     # queue_task must expose the same shape send_to_claude does (a single required
     # string `text`), so Gemini can relay an ADDITIONAL instruction verbatim while a
@@ -190,6 +202,23 @@ def test_git_tools_are_not_loop_guarded():
         assert op._allow_tool(name) is True
 
 
+def test_system_instruction_has_operator_principles_preamble():
+    # The "HOW YOU WORK" preamble encodes the five researched voice-operator
+    # patterns (spoken-output constraint, operator-not-coder allow-list,
+    # no-impersonation, clarity gate, examples-are-not-tasks) and must appear
+    # BEFORE the folder/task detail sections so it frames everything after it.
+    from server.gemini_operator import SYSTEM_INSTRUCTION as s
+    assert "HOW YOU WORK" in s
+    assert s.index("HOW YOU WORK") < s.index("CHOOSING THE FOLDER")
+    low = s.lower()
+    assert "spoken aloud" in low and "no screen" in low          # output channel
+    assert "operator, not the coder" in low                       # allow-list framing
+    assert "defer everything else to" in low
+    assert "never speak or act as if you are claude" in low       # no impersonation
+    assert "clear request you actually heard" in low              # clarity gate
+    assert "—" not in s
+
+
 def test_system_instruction_covers_git_flow():
     from server.gemini_operator import SYSTEM_INSTRUCTION
     s = SYSTEM_INSTRUCTION
@@ -200,6 +229,24 @@ def test_system_instruction_covers_git_flow():
     git_section = s[s.index("GIT BY VOICE"):]
     assert "resolve_approval" in git_section
     assert "branch" in git_section
+
+
+def test_system_instruction_covers_multiple_sessions():
+    # Fix 5: the operator must be told several sessions can run at once, how to
+    # recognize which project a relayed update belongs to, never attribute one
+    # session's output to another, and to switch_session (or ask) instead of
+    # guessing when a request targets a session other than the attached one.
+    from server.gemini_operator import SYSTEM_INSTRUCTION as s
+    assert "MULTIPLE SESSIONS" in s
+    # Placed near the existing SESSIONS (fleet) paragraph.
+    assert s.index("SESSIONS (a fleet)") < s.index("MULTIPLE SESSIONS")
+    section = s[s.index("MULTIPLE SESSIONS"):]
+    low = section.lower()
+    assert "[project]" in low
+    assert "never attribute" in low or "never" in low and "attribute" in low
+    assert "switch_session" in section
+    assert "ask" in low
+    assert "—" not in s
 
 
 def test_system_instruction_routes_start_new_session_to_new_session():
@@ -296,3 +343,262 @@ def test_build_config_lang_without_voice_still_sets_language_code():
     cfg = op._build_config()
     assert cfg.speech_config.language_code == "ar-XA"
     assert cfg.speech_config.voice_config is None
+
+
+def test_get_cost_tool_declaration_present_and_no_params():
+    decls = {d["name"]: d for d in TOOL_DECLARATIONS}
+    assert "get_cost" in decls
+    assert decls["get_cost"]["parameters"]["properties"] == {}
+    assert "token" in decls["get_cost"]["description"].lower()
+
+
+def test_get_cost_tool_is_not_loop_guarded():
+    op = GeminiOperator(_cfg(), _noop)
+    assert op._allow_tool("get_cost") is True
+
+
+def test_system_instruction_covers_cost_by_voice():
+    from server.gemini_operator import SYSTEM_INSTRUCTION as s
+    low = s.lower()
+    assert "get_cost" in s
+    assert "cost" in low and "token" in low
+    # No em dash anywhere in the prompt (still true after this addition).
+    assert "—" not in s
+
+
+class _FakeContentSession:
+    """Captures send_client_content payloads (text + turn_complete)."""
+
+    def __init__(self):
+        self.turns = []
+
+    async def send_client_content(self, turns=None, turn_complete=None):
+        self.turns.append((turns.parts[0].text, turn_complete))
+
+
+async def test_open_with_context_sends_background_and_opening_in_one_turn():
+    op = GeminiOperator(_cfg(), _noop)
+    fake = _FakeContentSession()
+    op._session = fake
+    op._ready.set()
+    await op.open_with_context("Hi. You're back in loop.",
+                               "You: fix the tests\nClaude: done, 42 passing")
+    assert len(fake.turns) == 1
+    text, complete = fake.turns[0]
+    assert complete is True
+    assert "for your context only" in text
+    assert "42 passing" in text
+    assert text.rstrip().endswith("Tell the user: Hi. You're back in loop.")
+    # The background must come BEFORE the spoken directive.
+    assert text.index("42 passing") < text.index("Tell the user:")
+
+
+async def test_open_with_context_without_context_falls_back_to_speak():
+    op = GeminiOperator(_cfg(), _noop)
+    fake = _FakeContentSession()
+    op._session = fake
+    op._ready.set()
+    await op.open_with_context("Hi there.", "")
+    # speak() debounces through a task; let it flush.
+    import asyncio as _a
+    await _a.sleep(0.05)
+    if op._speak_task:
+        await op._speak_task
+    assert len(fake.turns) == 1
+    text, _ = fake.turns[0]
+    assert text == "Tell the user: Hi there."
+
+
+# --- Task D1: barge-in mode with tuned VAD ----------------------------------
+
+def test_barge_in_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("VOXA_BARGE_IN", raising=False)
+    assert barge_in_enabled() is True
+
+
+def test_barge_in_disabled_by_env_zero(monkeypatch):
+    monkeypatch.setenv("VOXA_BARGE_IN", "0")
+    assert barge_in_enabled() is False
+
+
+def test_barge_in_disabled_by_env_false(monkeypatch):
+    monkeypatch.setenv("VOXA_BARGE_IN", "false")
+    assert barge_in_enabled() is False
+
+
+def test_barge_in_disabled_by_empty_env(monkeypatch):
+    monkeypatch.setenv("VOXA_BARGE_IN", "")
+    assert barge_in_enabled() is False
+
+
+def test_build_config_barge_in_on_uses_automatic_activity_detection(monkeypatch):
+    # Default (unset) env -> barge-in ON: Gemini's own VAD handles turn taking,
+    # tuned for a quick, confident interrupt, and NO_INTERRUPTION must be gone.
+    monkeypatch.delenv("VOXA_BARGE_IN", raising=False)
+    monkeypatch.delenv("VOXA_VAD_SILENCE_MS", raising=False)
+    op = GeminiOperator(_cfg(), _noop)
+    cfg = op._build_config()
+    ric = cfg.realtime_input_config
+    assert ric.activity_handling != types.ActivityHandling.NO_INTERRUPTION
+    aad = ric.automatic_activity_detection
+    assert aad is not None
+    assert aad.start_of_speech_sensitivity == types.StartSensitivity.START_SENSITIVITY_HIGH
+    assert aad.end_of_speech_sensitivity == types.EndSensitivity.END_SENSITIVITY_HIGH
+    assert aad.prefix_padding_ms == 40
+    assert aad.silence_duration_ms == 300
+
+
+def test_build_config_barge_in_on_respects_vad_silence_env(monkeypatch):
+    monkeypatch.delenv("VOXA_BARGE_IN", raising=False)
+    monkeypatch.setenv("VOXA_VAD_SILENCE_MS", "500")
+    op = GeminiOperator(_cfg(), _noop)
+    cfg = op._build_config()
+    assert cfg.realtime_input_config.automatic_activity_detection.silence_duration_ms == 500
+
+
+def test_build_config_barge_in_off_matches_today_no_interruption(monkeypatch):
+    # VOXA_BARGE_IN=0 must reproduce today's config verbatim: NO_INTERRUPTION,
+    # no automatic activity detection tuning.
+    monkeypatch.setenv("VOXA_BARGE_IN", "0")
+    op = GeminiOperator(_cfg(), _noop)
+    cfg = op._build_config()
+    ric = cfg.realtime_input_config
+    assert ric.activity_handling == types.ActivityHandling.NO_INTERRUPTION
+    assert ric.automatic_activity_detection is None
+
+
+class _FakeAudioSession:
+    """Captures send_realtime_input calls for send_audio half-duplex tests."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_realtime_input(self, audio=None):
+        self.sent.append(audio)
+
+
+async def test_send_audio_forwards_during_playback_when_barge_in_on(monkeypatch):
+    monkeypatch.delenv("VOXA_BARGE_IN", raising=False)
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeAudioSession()
+    op._ready.set()
+    op._play_until = time.monotonic() + 10.0   # reply still "playing"
+    await op.send_audio(b"\x01\x02")
+    assert len(op._session.sent) == 1
+
+
+async def test_send_audio_drops_during_playback_when_barge_in_off(monkeypatch):
+    monkeypatch.setenv("VOXA_BARGE_IN", "0")
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeAudioSession()
+    op._ready.set()
+    op._play_until = time.monotonic() + 10.0   # reply still "playing"
+    await op.send_audio(b"\x01\x02")
+    assert len(op._session.sent) == 0
+
+
+class _FakeServerContent:
+    def __init__(self, interrupted=False):
+        self.interrupted = interrupted
+        self.output_transcription = None
+        self.input_transcription = None
+
+
+async def test_speak_dedupe_key_scopes_cross_call_check():
+    # Fix 3: two DIFFERENT sessions' updates must never collapse into one another
+    # just because they happen to arrive in the same dedupe window. Different keys
+    # each get their own "last spoken" slot.
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeSession()
+    op._ready.set()
+    op._speak_debounce = 0.01
+    await op.speak("veil finished: tests pass", dedupe_key="/a")
+    await op._speak_task
+    await op.speak("loop finished: tests pass", dedupe_key="/b")
+    await op._speak_task
+    assert len(op._session.spoken) == 2   # neither dropped
+
+
+async def test_speak_dedupe_key_same_key_same_text_is_dropped():
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeSession()
+    op._ready.set()
+    op._speak_debounce = 0.01
+    await op.speak("veil finished: tests pass", dedupe_key="/a")
+    await op._speak_task
+    before = op._speak_task
+    await op.speak("veil finished: tests pass", dedupe_key="/a")   # identical, same key
+    assert op._speak_task is before   # deduped: no new flush scheduled
+    assert len(op._session.spoken) == 1
+
+
+async def test_speak_unkeyed_default_matches_todays_behavior():
+    # Default dedupe_key="" for callers that don't pass one (e.g. the hub attach
+    # relay's `lambda t: operator.speak(t)`) keeps today's single-slot dedupe.
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeSession()
+    op._ready.set()
+    op._speak_debounce = 0.01
+    await op.speak("Done: created index.html.")
+    await op._speak_task
+    before = op._speak_task
+    await op.speak("Done: created index.html.")
+    assert op._speak_task is before
+    assert len(op._session.spoken) == 1
+
+
+async def test_flush_speak_keeps_two_burst_lines_with_different_tags():
+    # Fix 3: a burst that happens to contain two DIFFERENT sessions' bracket-tagged
+    # lines must keep both even if they're highly similar; only the tag-matching (or
+    # untagged) collapse logic applies.
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeSession()
+    op._ready.set()
+    op._speak_debounce = 0.01
+    await op.speak("[veil] finished: tests pass, 3 skipped.")
+    await op.speak("[loop] finished: tests pass, 3 skipped.")
+    await op._speak_task
+    assert len(op._session.spoken) == 1
+    spoken = op._session.spoken[0]
+    assert "[veil]" in spoken and "[loop]" in spoken
+
+
+async def test_flush_speak_untagged_lines_still_collapse_as_today():
+    op = GeminiOperator(_cfg(), _noop)
+    op._session = _FakeSession()
+    op._ready.set()
+    op._speak_debounce = 0.01
+    await op.speak("Done: created index.html.")
+    await op.speak("Done, created index.html.")   # near-identical, no tags
+    await op._speak_task
+    spoken = op._session.spoken[0]
+    assert spoken.count("index.html") == 1
+
+
+def test_line_tag_helper():
+    from server.gemini_operator import _line_tag
+    assert _line_tag("[veil] finished: ok") == "veil"
+    assert _line_tag("plain text, no tag") == ""
+    assert _line_tag("[loop] ") == "loop"
+
+
+async def test_run_resets_stale_play_until_on_interrupted():
+    # A stale playback window must never gate the mic after an interruption in
+    # half-duplex mode: sc.interrupted must reset _play_until to 0.0.
+    import pytest
+    op = GeminiOperator(_cfg(), _noop)
+    flushed = []
+
+    async def _text_out(msg):
+        flushed.append(msg)
+
+    op.set_text_out(_text_out)
+    op.suppress_greeting()
+    op._play_until = time.monotonic() + 50.0   # stale window from a prior reply
+    resp = _FakeLiveResponse()
+    resp.server_content = _FakeServerContent(interrupted=True)
+    op._session = _FakeReceiveSession([resp])
+    with pytest.raises(RuntimeError):
+        await op.run()
+    assert op._play_until == 0.0
+    assert {"type": "flush_audio"} in flushed

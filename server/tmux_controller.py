@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Awaitable, Callable, Optional, Sequence
 
 
@@ -239,8 +240,66 @@ def stable_key(text: str) -> str:
     return "\n".join(out)
 
 
-# Claude shows these only while actively generating; their presence means "working".
+# Markers that mean SOMETHING is happening on screen (generation or a prompt
+# waiting on the user): they arm the finished-announce (_saw_work).
 _ACTIVE_MARKERS = ("esc to interrupt", "esc to cancel")
+# Marker Claude shows ONLY while actively generating. This, and only this, may
+# hold status at "working": "esc to cancel" also appears on interactive prompts
+# (trust dialogs, permission menus, "Enter to confirm · Esc to cancel"), where
+# Claude is WAITING on the user, not working — treating those as busy suppressed
+# the prompt announcement and made the orchestrator refuse dispatches while a
+# question sat on screen.
+_GENERATING_MARKERS = ("esc to interrupt",)
+
+# Newer Claude Code builds dropped the persistent "esc to interrupt" hint; while
+# working they show a spinner-glyph status line instead, e.g.
+#   "✳ Protoys, Build and ship prototypes, protoys.app…"  (early)
+#   "✻ Doing X… (4s · thinking with high effort)"          (thinking)
+#   "✳ Churned for 2m 25s · 1 shell still running"         (tool running)
+# The settled post-turn line ("✻ Crunched for 13s") also starts with a glyph but
+# has none of the live suffixes, so it must NOT count as generating.
+_SPIN_GLYPHS = "·✳✶✻✽✢✣✤✥*"
+_GEN_LINE_RE = re.compile(r"(…|\(\d+[smh]|still running)")
+
+
+def pane_is_generating(text: str) -> bool:
+    """True while the pane shows Claude actively generating, across TUI versions:
+    the old persistent "esc to interrupt" hint, or a live spinner status line
+    (glyph-prefixed with an ellipsis / elapsed-timer / running-tools suffix)."""
+    plain = _ANSI_RE.sub("", text or "")
+    if any(m in plain.lower() for m in _GENERATING_MARKERS):
+        return True
+    for ln in plain.splitlines():
+        s = ln.strip()
+        if s and s[0] in _SPIN_GLYPHS and _GEN_LINE_RE.search(s):
+            return True
+    return False
+
+def interrupt_needs_retry(before: str, now: str) -> bool:
+    """After an Escape aimed at a running generation, decide whether ANOTHER
+    press is needed. One Escape is not always enough: with vim keybindings the
+    composer sits in INSERT mode after a send and the first press is consumed
+    leaving insert mode while the generation keeps streaming (verified live).
+
+    Version-proof across Claude Code TUIs, which no longer show a reliable
+    "working" marker (current builds stream with NO spinner line and NO footer):
+      - the interrupt is CONFIRMED when "interrupted" appears near the bottom
+        (checked on the tail only: Terminal.app/AX captures include scrollback,
+        where an old interrupt would false-positive);
+      - a settled screen showing the composer prompt (❯) means nothing was
+        running (or the interrupt already landed without its banner) -> stop;
+      - anything else (screen still mutating = streaming, or a promptless
+        static screen = thinking) -> press again."""
+    plain_now = _ANSI_RE.sub("", now or "")
+    tail = "\n".join(plain_now.splitlines()[-40:]).lower()
+    if "interrupted" in tail:
+        return False
+    if pane_is_generating(now):
+        return True
+    if "❯" in plain_now and now == before:
+        return False
+    return True
+
 
 _MENU_RE = re.compile(r"^\s*[>❯]?\s*\d+[.)]\s+\S", re.MULTILINE)
 _YESNO_RE = re.compile(r"\(y/n\)|\[y/n\]|\(yes/no\)", re.IGNORECASE)
@@ -273,6 +332,16 @@ def _send_settle_seconds() -> float:
         return 0.3
 
 
+def _default_stuck_seconds() -> float:
+    """How long the pane may sit unchanged WHILE GENERATING before the monitor
+    fires the one-time "stuck" signal, read PER CALL (VOXA_STUCK_SECONDS) so it
+    is tunable and testable. 0 (or negative) disables stuck detection."""
+    try:
+        return float(os.environ.get("VOXA_STUCK_SECONDS", "300"))
+    except (TypeError, ValueError):
+        return 300.0
+
+
 def _send_enter_retries() -> int:
     """How many extra Enters to try if the first didn't submit (VOXA_SEND_ENTER_RETRIES).
     An Enter on an already-submitted/empty input is a harmless no-op in Claude Code, so
@@ -282,6 +351,17 @@ def _send_enter_retries() -> int:
         return max(0, int(os.environ.get("VOXA_SEND_ENTER_RETRIES", "3")))
     except (TypeError, ValueError):
         return 3
+
+
+def _busy_grace_seconds() -> float:
+    """Seconds after a send during which status='working' is trusted WITHOUT
+    consulting the pane (VOXA_BUSY_GRACE_SECONDS): generation takes a moment to
+    start rendering, and verify-on-read must never double-dispatch into that
+    gap. Read per call so it is tunable and testable."""
+    try:
+        return max(0.0, float(os.environ.get("VOXA_BUSY_GRACE_SECONDS", "10")))
+    except (TypeError, ValueError):
+        return 10.0
 
 
 def _input_still_pending(pane_text: str, typed: str) -> bool:
@@ -327,6 +407,17 @@ async def monitor_loop(ctrl) -> None:
             cur = ctrl._capture()
         except Exception:
             break  # session gone
+        # The generating marker is the authoritative "still working" signal.
+        # Screen stability alone must not flip to idle (a long thinking stretch
+        # renders no new output, and the stability key strips the marker
+        # itself), so hold "working" and reset the count: idle needs a full
+        # quiet window AFTER the marker is gone. ONLY the generating marker
+        # counts: prompt screens ("Esc to cancel") are waiting on the USER.
+        busy = pane_is_generating(cur)
+        if busy:
+            ctrl.status = "working"
+            active = True
+            stable = 0
         key = stable_key(cur)
         if key != last_key:
             last_key = key
@@ -340,7 +431,7 @@ async def monitor_loop(ctrl) -> None:
                 await emit_output_color(cur)
         else:
             stable += 1
-            if active and stable >= ctrl._idle_polls:
+            if not busy and active and stable >= ctrl._idle_polls:
                 cur_clean = clean_pane(cur)
                 delta = new_text(announced, cur_clean)
                 announced = cur_clean
@@ -376,6 +467,7 @@ class TmuxController:
         poll_interval: float = 1.2,
         idle_polls: int = 3,
         timeout: float = 180.0,
+        stuck_seconds: float | None = None,
     ):
         self._socket = socket
         self._run = runner or _make_default_runner(socket)
@@ -385,6 +477,10 @@ class TmuxController:
         self._poll = poll_interval
         self._idle_polls = idle_polls
         self._timeout = timeout
+        # Seconds the pane may sit unchanged while Claude is GENERATING before
+        # _monitor fires the one-time "stuck" signal (VOXA_STUCK_SECONDS, read
+        # here so a fresh controller always picks up the current env; 0 disables).
+        self._stuck_seconds = _default_stuck_seconds() if stuck_seconds is None else stuck_seconds
         self.status = "idle"
         # True once this session has actually worked (or been sent a task) since the
         # last announce. Gates the "finished" announce so a fresh session that merely
@@ -394,11 +490,16 @@ class TmuxController:
         # to ~1.2s), so two rapid sends (double-tap, or a queue item overlapping a
         # typed command) must not interleave their send-keys into the same pane.
         self._send_lock = asyncio.Lock()
+        # When the last send() happened, for verify_working's grace window.
+        self._last_send_at = float("-inf")
         self.working_dir: Optional[str] = None
         # Set by start() when the visible terminal window could NOT be opened, so the
         # caller can tell the user how to attach manually (e.g. Automation denied).
         self.window_hint = ""
         self._final_cb: Optional[FinalCallback] = None
+        # Optional callback for a stuck-agent alert (see on_stuck / _monitor); None
+        # means stuck detection is fully inert (fail-open, no behavior change).
+        self._on_stuck = None
         # Live-output callbacks: stream Claude's current screen to the UI while it
         # works. _on_output gets plain text (back-compat); _on_output_color gets the
         # same lines with ANSI colour escapes kept, for the terminal-themed view.
@@ -406,6 +507,8 @@ class TmuxController:
         self._on_output_color = None
         self._started = False
         self._monitor_task: Optional[asyncio.Task] = None
+        # One auto-Enter per appearance of the folder-trust prompt (see _monitor).
+        self._trust_answered = False
 
     def set_terminal_app(self, app: str) -> None:
         """Override which terminal app to open (e.g. from a phone setting)."""
@@ -414,6 +517,13 @@ class TmuxController:
 
     def on_final(self, cb: FinalCallback) -> None:
         self._final_cb = cb
+
+    def on_stuck(self, cb) -> None:
+        """Register a callback invoked ONCE per quiet-while-generating stretch
+        that outlasts VOXA_STUCK_SECONDS: cb(elapsed_seconds). Mirrors on_final;
+        default is None, so nothing fires unless a caller registers one (the
+        controller itself never rings the phone directly for a stuck agent)."""
+        self._on_stuck = cb
 
     def on_output(self, cb) -> None:
         """Register a callback that receives Claude's live screen text (cleaned)."""
@@ -601,6 +711,7 @@ class TmuxController:
         if not self._started:
             raise ValueError("call start() before send()")
         self.status = "working"
+        self._last_send_at = time.monotonic()   # verify_working's grace window
         self._saw_work = True   # a dispatched task should announce when it finishes
         typed = text or ""
         settle = _send_settle_seconds()
@@ -634,6 +745,28 @@ class TmuxController:
                 logger.exception("tmux send failed")
                 self.status = "error"
                 return False
+
+    async def verify_working(self) -> bool:
+        """Is Claude REALLY still working? send() sets status='working'
+        optimistically and only the monitor's activity-then-quiet cycle resets
+        it, so a send that never produced pane activity (e.g. an instruction
+        that failed to submit) wedges the flag forever and every later dispatch
+        is refused as busy. The orchestrator's busy guard calls this at
+        decision time: a fresh send is trusted for a short grace window, after
+        that the LIVE pane is consulted; no generating marker means the flag is
+        stale, so it heals to idle. Fail-safe: a capture error keeps the old
+        answer (True) rather than risking a double dispatch."""
+        if time.monotonic() - self._last_send_at < _busy_grace_seconds():
+            return True
+        try:
+            pane = await asyncio.to_thread(self._capture)
+        except Exception:
+            return True
+        if pane_is_generating(pane):
+            return True
+        logger.info("busy flag was stale; verified idle from the live pane")
+        self.status = "idle"
+        return False
 
     async def press(self, key: str) -> None:
         """Inject a single keypress WITHOUT Enter, used to answer a structured
@@ -721,15 +854,71 @@ class TmuxController:
         announced = clean_pane(baseline)
         stable = 0
         active = False
+        # Stuck-detection state: stuck_since is the monotonic time the CURRENT
+        # stable_key first appeared while Claude was generating; stuck_key is
+        # that key (so a pane change is detected even if last_key/key bookkeeping
+        # above hasn't updated yet); stuck_fired latches so at most one on_stuck
+        # callback fires per quiet-while-generating stretch.
+        stuck_since: float | None = None
+        stuck_key: str | None = None
+        stuck_fired = False
         while self._started:
             await asyncio.sleep(self._poll)
             try:
                 cur = self._capture()
             except Exception:
                 break  # session gone
-            if any(m in cur.lower() for m in _ACTIVE_MARKERS):
-                self._saw_work = True
+            plain = _ANSI_RE.sub("", cur).lower()
+            if any(m in plain for m in _ACTIVE_MARKERS):
+                self._saw_work = True   # generation OR a prompt: announce on settle
+            # Auto-accept the folder-trust prompt on sessions VOXA launched: the
+            # user explicitly asked to open this folder, so the trust question is
+            # their own already-stated intent, and an unanswered prompt strands
+            # the session ("it can't press enter"). "Yes, I trust this folder" is
+            # preselected, so a single Enter confirms. One press per appearance.
+            if "trust this folder" in plain:
+                if not self._trust_answered:
+                    self._trust_answered = True
+                    try:
+                        self._run(["send-keys", "-t", self._session, "Enter"])
+                    except Exception:
+                        logger.exception("auto-trust press failed")
+                continue
+            self._trust_answered = False
+            # The generating marker is the authoritative "still working" signal.
+            # Screen stability alone must not flip to idle (a long thinking
+            # stretch renders no new output, and _stable_key strips the marker
+            # itself), so hold "working" and reset the count: idle needs a full
+            # quiet window AFTER the marker is gone. ONLY the generating marker
+            # counts here: prompt screens ("Esc to cancel") are waiting on the
+            # USER and must settle to idle so they get announced and answered.
+            busy = pane_is_generating(cur)
+            if busy:
+                self.status = "working"
+                active = True
+                stable = 0
             key = self._stable_key(cur)
+            # Stuck detection: only while ACTUALLY generating (never on a mere
+            # idle prompt sitting unanswered). Reset the timer and the one-time
+            # latch whenever the pane changes or Claude stops generating, so
+            # each new quiet-while-working stretch can alert at most once, and
+            # a normal finish (busy goes False) never triggers it.
+            if busy and self._stuck_seconds > 0:
+                if stuck_since is None or key != stuck_key:
+                    stuck_since = time.monotonic()
+                    stuck_key = key
+                    stuck_fired = False
+                elif not stuck_fired and (time.monotonic() - stuck_since) >= self._stuck_seconds:
+                    stuck_fired = True
+                    cb = self._on_stuck
+                    if cb is not None:
+                        result = cb(time.monotonic() - stuck_since)
+                        if inspect.isawaitable(result):
+                            await result
+            else:
+                stuck_since = None
+                stuck_key = None
+                stuck_fired = False
             if key != last_key:
                 last_key = key
                 stable = 0
@@ -738,7 +927,7 @@ class TmuxController:
                 await self._emit_output_color(cur)   # colour live stream (themed view)
             else:
                 stable += 1
-                if active and stable >= self._idle_polls:
+                if not busy and active and stable >= self._idle_polls:
                     cur_clean = clean_pane(cur)
                     delta = new_text(announced, cur_clean)
                     announced = cur_clean
@@ -750,6 +939,37 @@ class TmuxController:
                     if self._saw_work or looks_actionable(cur_clean):
                         self._saw_work = False
                         await self._emit(delta)
+
+    async def interrupt(self) -> None:
+        """Stop the CURRENT generation only: send Escape and leave everything else
+        running (tmux session, monitor, _started). Claude Code shows 'Interrupted'
+        and returns to its prompt with context intact, so the user can follow up
+        immediately; the monitor announces the settled screen as usual. Status is
+        optimistically set idle so a follow-up dispatch isn't refused as busy; if
+        Claude is somehow still generating, the monitor re-detects the active
+        marker on its next poll and flips it back. Contrast stop(), which also
+        detaches the monitor (call teardown / controller swap).
+
+        One Escape is NOT always enough (vim INSERT mode eats the first press);
+        see interrupt_needs_retry for the retry decision. The 0.7s gap keeps two
+        consecutive presses from reading as a double-esc (history jump) if the
+        first one already landed the interrupt."""
+        if not self._started:
+            return
+        try:
+            before = self._capture()
+            self._run(["send-keys", "-t", self._session, "Escape"])
+            for _ in range(2):
+                await asyncio.sleep(0.7)
+                now = self._capture()
+                if not interrupt_needs_retry(before, now):
+                    break
+                before = now
+                self._run(["send-keys", "-t", self._session, "Escape"])
+        except Exception:
+            logger.exception("tmux interrupt failed")
+            return
+        self.status = "idle"
 
     async def stop(self, *, detach_only: bool = False) -> None:
         # Do NOT kill the tmux session: the laptop terminal must stay usable after the

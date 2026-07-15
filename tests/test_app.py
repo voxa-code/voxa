@@ -194,6 +194,19 @@ async def test_stop_control_calls_stop_claude():
     assert ("stop_claude", {}) in calls
 
 
+async def test_screenshot_control_calls_take_screenshot():
+    import json
+    from server.app import handle_client_control
+    calls = []
+    class FakeOrch:
+        async def handle_tool_call(self, n, a): calls.append((n, a)); return {}
+        def set_terminal_app(self, a): pass
+    class FakeWS:
+        async def send_json(self, m): pass
+    await handle_client_control(json.dumps({"type": "screenshot"}), FakeOrch(), FakeWS())
+    assert ("take_screenshot", {}) in calls
+
+
 async def test_claude_key_control_presses_named_key():
     import json
     from server.app import handle_client_control
@@ -334,6 +347,14 @@ def test_compose_opening_project_without_detail():
                  "What would you like to do next?")
 
 
+def test_compose_opening_project_with_no_updates_claims_no_finish():
+    # A fresh connect with NOTHING pending must not fabricate "your last task
+    # just finished" (a brand-new session heard that lie on its first hello).
+    o = compose_opening("veil", [])
+    assert o == "Hi. You're back in veil. What would you like to do next?"
+    assert "finished" not in o
+
+
 def test_compose_opening_no_project_with_detail():
     o = compose_opening("", ["app finished: shipped the fix"])
     assert o.startswith("Hi. Your last task just finished. Here's what it did: shipped the fix.")
@@ -400,9 +421,11 @@ def test_hook_stop_rings_when_app_closed(monkeypatch):
     assert any("finished" in m for m in cm._pending)   # a call was queued
 
 
-def test_hook_does_not_ring_when_app_open(monkeypatch):
-    # App open (connected, but no metered line yet): the update must NOT ring, but it
-    # must still be queued so it's spoken when the user taps Start (not silently lost).
+def test_hook_still_rings_when_app_open(monkeypatch):
+    # App open (connected, but no metered line yet): a terminals-first app is
+    # "connected" whenever it's simply open, so the finish must still ring the
+    # phone, AND still be queued so it's spoken/rendered when the user taps
+    # Start or attaches (not silently lost).
     monkeypatch.setenv("VOXA_RING_QUIET_SECONDS", "0")   # immediate report
     app = create_app(Config("k", "model", "secret", "127.0.0.1", 8787),
                      operator_factory=fake_factory)
@@ -419,8 +442,32 @@ def test_hook_does_not_ring_when_app_open(monkeypatch):
     client = TestClient(app)
     client.post("/hook?token=secret",
                 json={"hook_event_name": "Stop", "session_id": "s3", "cwd": "/p/app"})
-    assert sent == []                                 # app open -> no ring
-    assert any("finished" in m for m in cm._pending)  # ...but queued to speak on Start
+    assert sent != []                                 # app open -> still rings
+    assert any("finished" in m for m in cm._pending)  # ...and queued to speak on Start
+
+
+def test_hook_finish_held_until_last_open_turn_stops(monkeypatch):
+    # A fleet: session "slow" is mid-turn (UserPromptSubmit, no Stop yet) when
+    # session "fast" finishes. The fast finish must NOT ring (held); when slow
+    # finally stops, ONE ring fires carrying both finishes.
+    monkeypatch.setenv("VOXA_RING_QUIET_SECONDS", "0")
+    app = create_app(Config("k", "model", "secret", "127.0.0.1", 8787),
+                     operator_factory=fake_factory)
+    cm = app.state.call_manager
+    client = TestClient(app)
+    client.post("/hook?token=secret",
+                json={"hook_event_name": "UserPromptSubmit", "session_id": "slow"})
+    client.post("/hook?token=secret",
+                json={"hook_event_name": "Stop", "session_id": "fast", "cwd": "/p/veil"})
+    assert cm._pending == []                       # held, not rung mid-fleet
+    assert "fast" in app.state.notifier.held_finishes
+    client.post("/hook?token=secret",
+                json={"hook_event_name": "Stop", "session_id": "slow", "cwd": "/p/loop"})
+    assert len(cm._pending) == 1                   # ONE call for the whole fleet
+    msg = cm._pending[0]
+    assert msg.startswith("All tasks are done.")
+    assert "loop finished" in msg and "veil finished" in msg
+    assert app.state.notifier.held_finishes == {}  # drained
 
 
 def test_hook_short_turn_does_not_ring(monkeypatch):
@@ -673,6 +720,31 @@ def test_hook_notification_rings_immediately_regardless_of_window(monkeypatch):
         "hook_event_name": "Notification", "session_id": "ni", "cwd": "/p/x",
         "message": "Claude needs your permission"})
     assert any("needs input" in m for m in cm._pending)   # immediate, no sleep
+
+
+def test_hook_notification_builds_options_from_non_driven_terminal(monkeypatch):
+    # The prompt lives in a terminal Voxa is NOT attached to (the fleet
+    # reality): the driven-pane scrape yields nothing, so the discovery
+    # fallback captures the matching terminal and the approval still carries
+    # the actual choices instead of a bare "needs your permission".
+    from server import hook_routes
+    menu = ("How should we depict it?\n"
+            " \x1b[38;5;153m❯\x1b[39m \x1b[38;5;246m1. Bold pictograms\x1b[39m\n"
+            "   2. Phone POV\n"
+            "   3. Kinetic type only\n"
+            " Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n")
+    monkeypatch.setattr(hook_routes, "_discovery_capture",
+                        lambda cwd: menu if cwd == "/p/trailer" else "")
+    app = create_app(Config("k", "model", "secret", "127.0.0.1", 8787),
+                     operator_factory=fake_factory)
+    client = TestClient(app)
+    client.post("/hook?token=secret", json={
+        "hook_event_name": "Notification", "session_id": "nd", "cwd": "/p/trailer",
+        "message": "Claude is waiting for your input"})
+    approval = app.state.notifier.approvals.active_for("/p/trailer")
+    assert approval is not None
+    assert [o["key"] for o in approval["options"]] == ["1", "2", "3"]
+    assert approval["options"][0]["label"] == "Bold pictograms"
 
 
 async def test_approval_decision_presses_key_and_resolves():
@@ -1449,9 +1521,12 @@ class _FakeWSChannel:
 
 
 @_acm2
-async def _attached_serve_ws(driven_cwd, monkeypatch, seed_approval=None):
+async def _attached_serve_ws(driven_cwd, monkeypatch, seed_approval=None, seed_pending=None):
     """Drive serve_ws to the point where a metered line is attached and yield
-    (notifier, operator, ws, sessions). Tears the connection down on exit."""
+    (notifier, operator, ws, sessions). Tears the connection down on exit.
+    ``seed_pending`` (a list of summary strings) queues updates onto the call
+    manager BEFORE the line attaches, mirroring how a background finish queues
+    while no phone is connected."""
     from server.ws_session import serve_ws
     from server.session import SessionRegistry, Session
     from server.session_hub import SessionHub
@@ -1472,6 +1547,8 @@ async def _attached_serve_ws(driven_cwd, monkeypatch, seed_approval=None):
         async def send_voip(self, *a, **k): return False
 
     cm = CallManager(_NoPush(), _FakeReg())
+    for text in (seed_pending or []):
+        cm.queue(text)
     from server.notifier import Notifier
     notifier = Notifier(cm, push_enabled=True)
     if seed_approval is not None:
@@ -1516,6 +1593,26 @@ async def test_answer_speaks_active_approval_options(monkeypatch):
         opening = op.spoke[0]
         assert "1: Yes" in opening and "2: No" in opening
         assert any(m.get("type") == "approval" for m in ws.sent)   # card also pushed
+
+
+async def test_missed_updates_control_sent_when_updates_queued_before_connect(monkeypatch):
+    # Updates that queued while no phone was connected (background finishes) are
+    # spoken in the opening AND pushed as a structured control so the phone UI can
+    # render them, not just have them read aloud.
+    async with _attached_serve_ws(
+            "/p/loop", monkeypatch,
+            seed_pending=["loop finished", "veil needs input"]) as (n, op, ws, sessions):
+        missed = [m for m in ws.sent if m.get("type") == "missed_updates"]
+        assert len(missed) == 1
+        assert missed[0]["items"] == [{"text": "loop finished"},
+                                      {"text": "veil needs input"}]
+        # Spoken opening is unchanged (still mentions the missed updates).
+        assert op.spoke, "opening was never spoken"
+
+
+async def test_no_missed_updates_control_when_nothing_queued(monkeypatch):
+    async with _attached_serve_ws("/p/loop", monkeypatch) as (n, op, ws, sessions):
+        assert not any(m.get("type") == "missed_updates" for m in ws.sent)
 
 
 async def test_midcall_foreign_approval_is_spoken_and_carded(monkeypatch):
@@ -1637,11 +1734,11 @@ async def test_restart_announcement_mentions_pending_queue(tmp_path, monkeypatch
         assert "say run them to continue" in opening
 
 
-# --- Task 3: mic-gate relax while a queue is engaged -----------------------------
+# --- Busy mode: the mic stays open while Claude works -----------------------------
 
 async def test_mic_forwards_while_working_when_queue_engaged(tmp_path, monkeypatch):
-    """While Claude is working, mic audio keeps flowing to Gemini ONLY when a queue
-    is engaged (non-empty), so the user can stack another instruction by voice."""
+    """While Claude is working, mic audio keeps flowing to Gemini so the user can
+    stack another instruction by voice."""
     from server.task_queue import TaskQueue
     qfile = str(tmp_path / "q.json")
     monkeypatch.setenv("VOXA_TASK_QUEUE_FILE", qfile)
@@ -1657,9 +1754,10 @@ async def test_mic_forwards_while_working_when_queue_engaged(tmp_path, monkeypat
         assert op.audio[before:] == [b"\x01\x02"]   # forwarded despite working
 
 
-async def test_mic_pauses_while_working_when_queue_empty(tmp_path, monkeypatch):
-    """No queue engaged + Claude working keeps today's cost-saving pause: mic audio
-    is dropped, never forwarded to the (billed) voice session."""
+async def test_mic_forwards_while_working_even_with_empty_queue(tmp_path, monkeypatch):
+    """Busy mode: the mic stays OPEN while Claude works even with no queue, so a
+    spoken "stop" / "status?" can reach Gemini mid-task (this replaced the old
+    cost-saving pause; a voice interrupt requires listening)."""
     from server.task_queue import TaskQueue
     qfile = str(tmp_path / "q.json")
     monkeypatch.setenv("VOXA_TASK_QUEUE_FILE", qfile)
@@ -1668,9 +1766,11 @@ async def test_mic_pauses_while_working_when_queue_empty(tmp_path, monkeypatch):
         sessions.active().controller.status = "working"
         before = len(op.audio)
         await ws._in.put({"type": "websocket.receive", "bytes": b"\x01\x02"})
-        for _ in range(40):
+        for _ in range(200):
+            if len(op.audio) > before:
+                break
             await _asyncio2.sleep(0.005)
-        assert op.audio[before:] == []   # dropped: empty queue + working
+        assert op.audio[before:] == [b"\x01\x02"]   # forwarded: mic open while busy
 
 
 async def test_approval_decision_git_action_executes_instead_of_pressing():

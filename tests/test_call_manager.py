@@ -1,4 +1,7 @@
 # tests/test_call_manager.py
+import asyncio
+import time
+
 import pytest
 from server.call_manager import CallManager
 
@@ -153,6 +156,73 @@ async def test_ring_survives_push_failure():
     cm = CallManager(FlakyPusher(), FakeRegistry())
     await cm.on_update("done")                   # must not raise despite push failure
     assert cm._pusher.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ring_pushes_multiple_tokens_in_parallel_not_sequentially():
+    # 3 registered tokens, each push sleeps 0.05s: if ring() awaited them one at
+    # a time the whole call would take >= 0.15s. Overlapped, it stays well under
+    # that (generous margin so this never flakes on a loaded CI box).
+    class SlowPusher:
+        def __init__(self):
+            self.sent = []
+        async def send_voip(self, token, call_id, summary, approval=None):
+            self.sent.append(token)
+            await asyncio.sleep(0.05)
+            return True
+
+    class ThreeTokenRegistry:
+        def tokens(self, account=None):
+            return ["DEV1", "DEV2", "DEV3"]
+
+    push = SlowPusher()
+    cm = CallManager(push, ThreeTokenRegistry())
+    start = time.monotonic()
+    await cm.ring("acct", "finished")
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.12                       # overlapped, not 3 x 0.05s
+    assert sorted(push.sent) == ["DEV1", "DEV2", "DEV3"]
+
+
+@pytest.mark.asyncio
+async def test_ring_one_raising_token_does_not_block_the_others():
+    class FlakyThreeTokenPusher:
+        def __init__(self):
+            self.sent = []
+        async def send_voip(self, token, call_id, summary, approval=None):
+            if token == "BAD":
+                raise RuntimeError("apns down for this token")
+            self.sent.append(token)
+            return True
+
+    class ThreeTokenRegistry:
+        def tokens(self, account=None):
+            return ["DEV1", "BAD", "DEV2"]
+
+    push = FlakyThreeTokenPusher()
+    cm = CallManager(push, ThreeTokenRegistry())
+    await cm.ring("acct", "finished")             # must not raise
+    assert sorted(push.sent) == ["DEV1", "DEV2"]
+
+
+@pytest.mark.asyncio
+async def test_ring_prunes_dead_410_token_among_parallel_pushes():
+    class MixedResultPusher:
+        async def send_voip(self, token, call_id, summary, approval=None):
+            return 410 if token == "DEAD" else True
+
+    class RecordingRegistry:
+        def __init__(self):
+            self.removed = []
+        def tokens(self, account=None):
+            return ["DEV1", "DEAD", "DEV2"]
+        def remove(self, token):
+            self.removed.append(token)
+
+    reg = RecordingRegistry()
+    cm = CallManager(MixedResultPusher(), reg)
+    await cm.ring("acct", "finished")
+    assert reg.removed == ["DEAD"]
 
 
 @pytest.mark.asyncio

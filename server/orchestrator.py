@@ -106,24 +106,6 @@ class Orchestrator:
         """The controller currently being driven (swaps when attaching to a terminal)."""
         return self._c
 
-    @property
-    def queue_engaged(self) -> bool:
-        """Whether the mic gate should stay OPEN. True while the controller is idle
-        (nothing to wait on, so the mic always flows) OR the driven cwd has a
-        non-empty queue (the user is stacking instructions and must be heard while a
-        task runs). False while working with no queue, so recv_loop keeps today's
-        cost-saving pause for non-queue users (byte-identical). Fail-open to False on
-        any queue error so a queue bug can never leave the mic billing forever."""
-        if getattr(self._c, "status", "idle") != "working":
-            return True
-        if self.queue is None:
-            return False
-        try:
-            return bool(self.queue.items(self._driven_cwd()))
-        except Exception:
-            logger.exception("queue_engaged check failed")
-            return False
-
     def set_final(self, cb) -> None:
         """Set the final-output callback (e.g. the session hub's handler) so it is
         preserved across controller swaps when attaching to a different terminal.
@@ -184,6 +166,26 @@ class Orchestrator:
             if exc:
                 logger.warning("send failed: %s", exc)
         task.add_done_callback(_done)
+
+    async def _still_working(self) -> bool:
+        """The busy guard's ground truth. Controllers set status='working'
+        optimistically on send and only their monitor resets it, so a send
+        that never produced pane activity wedges the flag and every later
+        dispatch is refused as busy forever. Trust 'working' only after the
+        controller re-verifies it against the live pane (verify_working heals
+        a stale flag to idle as a side effect). Controllers without
+        verify_working keep today's cached-flag behavior; fail-safe True on
+        any error (never risk a double dispatch)."""
+        if getattr(self._c, "status", "idle") != "working":
+            return False
+        verify = getattr(self._c, "verify_working", None)
+        if verify is None:
+            return True
+        try:
+            return bool(await verify())
+        except Exception:
+            logger.exception("verify_working failed; trusting cached busy state")
+            return True
 
     def _queue_idle(self, cwd: str) -> bool:
         """A queue_task dispatches immediately only when nothing is running or
@@ -440,7 +442,7 @@ class Orchestrator:
                     return s
         return None
 
-    async def _attach(self, sess: dict) -> dict:
+    async def _attach(self, sess: dict, include_recap: bool = True) -> dict:
         new = self._build_controller(sess)
         if new is None:
             return {"error": f"cannot control a {sess.get('app','')} terminal directly"}
@@ -455,13 +457,18 @@ class Orchestrator:
                 "type": "claude_output",
                 "text": "Live view isn't available for this terminal.",
             })
-        # Recap what this terminal was working on, read from Claude's own transcript.
+        # Recap what this terminal was working on, read from Claude's own
+        # transcript. Skipped on the phone's TAP path (include_recap=False):
+        # the recap exists for Gemini's context, the phone never renders it,
+        # and building it here held up the scrollback request queued right
+        # behind this control, so the just-opened terminal view sat blank.
         recap = ""
-        try:
-            from server.transcripts import recap as build_recap
-            recap = await asyncio.to_thread(build_recap, sess.get("cwd", ""))
-        except Exception:
-            pass
+        if include_recap:
+            try:
+                from server.transcripts import recap as build_recap
+                recap = await asyncio.to_thread(build_recap, sess.get("cwd", ""))
+            except Exception:
+                pass
         result = {"attached": sess["label"], "working_dir": sess.get("cwd", "")}
         if recap:
             result["recap"] = recap
@@ -582,6 +589,29 @@ class Orchestrator:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         await self._c.stop()
+        return await self._flush_queue()
+
+    async def interrupt_task(self) -> int:
+        """Stop the CURRENT run without tearing the session down: cancel any
+        in-flight send task, interrupt the controller's generation (tmux Escape /
+        SDK interrupt; controllers without interrupt fall back to a full stop),
+        and flush the queue (a stop drops the whole burst). Unlike cancel_all,
+        the session stays attached and driveable, so the user can immediately
+        say what to do instead. Returns how many queued+running items dropped."""
+        pending = list(self._bg)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        fn = getattr(self._c, "interrupt", None)
+        if fn is not None:
+            await fn()
+        else:
+            await self._c.stop()
+        return await self._flush_queue()
+
+    async def _flush_queue(self) -> int:
+        """Drop the driven cwd's queued items after a stop/interrupt; returns the
+        dropped count so the caller can speak it. Fail-open on the queue side."""
         dropped = 0
         if self.queue is not None:
             cwd = self._driven_cwd()
@@ -622,7 +652,7 @@ class Orchestrator:
             if t.exception():
                 logger.warning("claude_input send failed: %s", t.exception())
         task.add_done_callback(_done)
-        await self._notify({"type": "status", "status": "Claude working (mic paused)"})
+        await self._notify({"type": "status", "status": "Claude working"})
 
     async def press_key(self, key: str) -> dict:
         """Actuate a decided approval, or a named special key from the terminal
@@ -679,6 +709,27 @@ class Orchestrator:
                         "ask them to confirm; when they answer, call "
                         "resolve_approval with their decision."}
 
+    async def _maybe_gate_dangerous(self, text: str, via: str) -> dict | None:
+        """Classify ``text`` for a destructive/irreversible request; if flagged,
+        build a synthetic approval (same SYNTHETIC pattern as git_commit/git_push)
+        instead of letting send_to_claude/queue_task dispatch it straight away.
+        Returns the approval-offer dict to return from handle_tool_call, or None
+        when the text is safe to dispatch immediately."""
+        from server.danger import classify
+        reason = classify(text)
+        if not reason:
+            return None
+        from server.approvals import build_action_approval
+        cwd = self._c.working_dir or ""
+        capped = (text or "")[:120]
+        summary = f"Careful: this {reason}. Run it? {capped}"
+        action = {"kind": "dangerous_send", "cwd": cwd, "text": text, "via": via}
+        approval = build_action_approval(
+            cwd, summary, tool="dangerous_command", action=action,
+            options=[{"key": "y", "label": "Run it"},
+                     {"key": "n", "label": "Cancel"}])
+        return await self._offer_approval(approval)
+
     async def execute_approved_action(self, approval: dict) -> dict:
         """Run the pending action a synthetic approval carries, AFTER the user
         approved it (either path). Kept on the orchestrator so the tap path
@@ -688,20 +739,42 @@ class Orchestrator:
         action = (approval or {}).get("action") or {}
         kind = action.get("kind", "")
         cwd = action.get("cwd", "")
-        if kind == "git_commit":
-            res = await asyncio.to_thread(git_ops.git_commit, cwd,
-                                          action.get("message", ""))
-            if action.get("push") and "error" not in res:
-                pushed = await asyncio.to_thread(git_ops.git_push, cwd)
-                if "error" in pushed:
-                    # The commit landed; say so AND say the push failed, in one
-                    # spoken error, so the user knows the true state.
-                    return {"error": f"{res['summary']} But then: {pushed['error']}"}
-                res = {"summary": f"{res['summary']} {pushed['summary']}",
-                       "branch": res.get("branch", "")}
-            return res
-        if kind == "git_push":
-            return await asyncio.to_thread(git_ops.git_push, cwd)
+        if kind == "dangerous_send":
+            # Re-dispatch the ORIGINAL text through the same path it came from,
+            # now that the user has confirmed it. `confirmed=True` skips the
+            # danger gate on re-entry so this can't loop back into another
+            # approval.
+            text = action.get("text", "")
+            via = action.get("via", "send_to_claude")
+            if via == "send_to_claude":
+                self._dispatch(text)
+                await self._notify({"type": "status", "status": "Claude working"})
+                return {"summary": "Okay, running it."}
+            return await self.handle_tool_call(
+                "queue_task", {"text": text, "confirmed": True})
+        if kind in ("git_commit", "git_push"):
+            # Run the confirmed git action IN the visible Claude session (not a
+            # hidden subprocess) so the user watches it happen in their terminal.
+            # The preflight already validated the repo/branch at offer time and
+            # the user just approved; we hand Claude a tightly-scoped git-only
+            # instruction and let the monitor relay the result. _dispatch bypasses
+            # the danger gate (that gate lives in the send_to_claude/queue_task
+            # tools), so a confirmed commit/push can't loop back into an approval.
+            if kind == "git_commit":
+                msg = (action.get("message") or "").replace('"', "'")
+                instr = ("Using git only, stage all current changes and commit them "
+                         f'with exactly this message: "{msg}". Do not modify any files.')
+                if action.get("push"):
+                    instr += " Then push the current branch to its remote."
+            else:
+                instr = ("Using git only, push the current branch to its remote. "
+                         "Do not modify any files or make a commit.")
+            self._dispatch(instr)
+            await self._notify({"type": "status", "status": "Claude working"})
+            verb = "Committing" if kind == "git_commit" else "Pushing"
+            if kind == "git_commit" and action.get("push"):
+                verb = "Committing and pushing"
+            return {"summary": f"{verb} in the terminal now; I'll tell you when it's done."}
         return {"error": f"unknown pending action: {kind or 'none'}"}
 
     def _decide_key(self, decision: str, options: list[dict]) -> str:
@@ -782,30 +855,63 @@ class Orchestrator:
                 return {"error": "no_session",
                         "hint": "No Claude session is running. Ask the user which "
                                 "folder to work in (or to create one) before sending."}
-            self._dispatch(args.get("text", ""))
-            await self._notify({"type": "status", "status": "Claude working (mic paused)"})
-            return {"accepted": True, "status": "working"}
+            # Busy guard (server-side, authoritative): one task at a time. The
+            # mic stays open while Claude works, so Gemini WILL hear the user
+            # mid-task; whatever it decides, a second dispatch is refused here
+            # and steered to the right tool instead. Verified against the LIVE
+            # pane, never the cached flag alone (a wedged 'working' heals here).
+            if await self._still_working():
+                return {"error": "busy",
+                        "hint": "Claude is still working on the previous task; do "
+                                "NOT resend it. If this is a NEW instruction from "
+                                "the user, call queue_task with their exact words. "
+                                "If they want the current task stopped, call "
+                                "stop_claude. Otherwise just tell them it's still "
+                                "in progress."}
+            text = args.get("text", "")
+            if not args.get("confirmed"):
+                gate = await self._maybe_gate_dangerous(text, "send_to_claude")
+                if gate is not None:
+                    return gate
+            self._dispatch(text)
+            await self._notify({"type": "status", "status": "Claude working"})
+            return {"accepted": True, "status": "working",
+                    "note": "Claude is now working; its result will be relayed to "
+                            "you when it finishes. Until then, never call "
+                            "send_to_claude again or answer for Claude. If the "
+                            "user speaks meanwhile: queue_task for a new "
+                            "instruction, stop_claude to cancel, get_claude_status "
+                            "for progress, otherwise say it's still in progress."}
         if name == "queue_task":
             # Relay an ADDITIONAL instruction while a task runs: dispatch it now if
             # the driven session is idle with an empty queue (behaves like
             # send_to_claude), else enqueue it to run after the current one. Mirrors
             # send_to_claude's no_session guard so the loop-guard integrity holds.
             text = args.get("text", "")
+            confirmed = bool(args.get("confirmed"))
             if self.queue is None:
                 # No queue wired (bare orchestrator): fall back to a plain send.
-                return await self.handle_tool_call("send_to_claude", {"text": text})
+                return await self.handle_tool_call(
+                    "send_to_claude", {"text": text, "confirmed": confirmed})
             if not getattr(self._c, "_started", True):
                 return {"error": "no_session",
                         "hint": "No Claude session is running. Ask the user which "
                                 "folder to work in (or to create one) before queueing."}
+            if not confirmed:
+                gate = await self._maybe_gate_dangerous(text, "queue_task")
+                if gate is not None:
+                    return gate
             cwd = self._driven_cwd()
+            # Heal a wedged 'working' flag first: _queue_idle reads the cached
+            # status, and a stale one would wrongly enqueue instead of dispatch.
+            await self._still_working()
             if self._queue_idle(cwd):
                 item = self.queue.add(cwd, text)
                 self.queue.pop_next(cwd)   # mark it running (exactly once)
                 self._running_item_id = item["id"]
                 self._dispatch(text)
                 await self._notify({"type": "status",
-                                    "status": "Claude working (mic paused)"})
+                                    "status": "Claude working"})
                 await self._push_queue()
                 return {"accepted": True, "queued": False}
             self.queue.add(cwd, text)
@@ -823,12 +929,27 @@ class Orchestrator:
             self._last_terminals = await asyncio.to_thread(discover_claude_sessions)
             items = [
                 {"id": s["id"], "label": s["label"], "app": s["app"],
-                 "cwd": s.get("cwd", ""), "controllable": s["controllable"]}
+                 "cwd": s.get("cwd", ""), "controllable": s["controllable"],
+                 "backend": s.get("backend", ""),
+                 # Activity preview: lets the phone list and the voice operator
+                 # tell apart several sessions in the SAME folder by what each
+                 # one is doing ("working on X" vs an idle prompt) and for how
+                 # long it has been open.
+                 "status": s.get("status", ""), "hint": s.get("hint", ""),
+                 "age": s.get("age", "")}
                 for s in self._last_terminals
             ]
             # Send both keys: the phone reads `terminals`, the web client reads `items`.
             await self._notify({"type": "terminals", "terminals": items, "items": items})
             return {"terminals": items}
+        if name == "take_screenshot":
+            from server.screenshot import capture_screenshot
+            result = await capture_screenshot()
+            if "error" in result:
+                await self._notify({"type": "screenshot", "error": result["error"]})
+                return {"error": result["error"]}
+            await self._notify({"type": "screenshot", "image": result["image"]})
+            return {"status": "sent"}
         if name == "attach_terminal":
             sess = self._resolve_terminal(args)
             if sess is None:
@@ -844,7 +965,8 @@ class Orchestrator:
             if not sess.get("controllable"):
                 return {"error": f"that {sess.get('app','')} terminal can't be driven; "
                                  "run Claude inside tmux and I can attach"}
-            return await self._attach(sess)
+            return await self._attach(sess,
+                                      include_recap=args.get("recap") is not False)
         if name == "list_sessions":
             if self.sessions is None:
                 return {"error": "no session registry wired"}
@@ -929,23 +1051,45 @@ class Orchestrator:
             await self.push_sessions()
             return {"created": self._session_label(session)}
         if name == "get_claude_status":
+            # Answer from the live pane, not the cached flag: verification heals
+            # a wedged 'working' to idle before we report it.
+            await self._still_working()
             return {"status": self._c.status, "working_dir": self._c.working_dir}
         if name == "stop_claude":
-            dropped = await self.cancel_all()
-            res = {"status": "idle"}
+            dropped = await self.interrupt_task()
+            res = {"status": "interrupted",
+                   "note": "The task was stopped but the session is still open "
+                           "with its context intact. Confirm it stopped and ask "
+                           "the user what they'd like to do next."}
             if dropped:
                 res["dropped"] = dropped
             return res
         if name == "resolve_approval":
-            # Scope the lookup to the pane actually being driven, the same guard
-            # ws_session.py's approval_decision handler applies to a phone tap:
-            # a spoken decision may only press into the terminal that raised the
-            # STILL-CURRENT prompt, never a stale one left over from a swap.
+            # Prefer the pane actually being driven; fall back to the latest
+            # approval from ANY session (the user may be answering a menu that
+            # rang from a fleet member Voxa isn't attached to). A spoken
+            # decision still only ever presses into the terminal that raised
+            # the STILL-CURRENT prompt: for a foreign approval we attach to its
+            # terminal first, and refuse if that attach fails.
             driven_cwd = (getattr(self._c, "working_dir", "") or "").rstrip("/")
             approval = (self.approvals.active_for(driven_cwd)
                         if (self.approvals and driven_cwd) else None)
+            if approval is None and self.approvals is not None:
+                approval = self.approvals.latest()
             if not approval or not approval.get("options"):
                 return {"error": "no active approval"}
+            target_cwd = (approval.get("cwd") or "").rstrip("/")
+            if approval.get("action") and target_cwd and target_cwd != driven_cwd:
+                # Synthetic (git) approvals have no pane to attach to; keep the
+                # original strict guard: only the driven cwd's action may run.
+                return {"error": "no active approval"}
+            if (not approval.get("action") and target_cwd
+                    and target_cwd != driven_cwd):
+                res = await self.attach_source(target_cwd)
+                if isinstance(res, dict) and "error" in res:
+                    return {"error": f"the prompt is in {target_cwd} but I "
+                                     f"couldn't attach to it: {res['error']}"}
+                driven_cwd = target_cwd
             key = self._decide_key(args.get("decision", ""), approval["options"])
             if approval.get("action"):
                 # Synthetic (git) approval: there is no on-screen prompt to
@@ -958,7 +1102,14 @@ class Orchestrator:
                     return {"declined": True,
                             "summary": "Okay, cancelled; nothing was run."}
                 return await self.execute_approved_action(approval)
-            await self.press_key(key)
+            press_result = await self.press_key(key)
+            if isinstance(press_result, dict) and "error" in press_result:
+                # The press itself failed (no session, unsupported key, ...): leave
+                # the approval active so the user can retry, instead of resolving
+                # it and telling them a selection happened when nothing reached
+                # the live pane (the phantom-selection bug this guards against).
+                return {"error": f"couldn't press {key}: {press_result['error']}. "
+                                 "The prompt is still waiting; nothing was selected."}
             self.approvals.resolve(approval["approval_id"])
             # Resume a queue burst that paused on this needs_input, so the next
             # queued item dispatches once the user has decided. No-op otherwise.
@@ -980,6 +1131,12 @@ class Orchestrator:
                 kwargs["search"] = args["search"]
             return await asyncio.to_thread(
                 lambda: transcripts.read_session(cwd, **kwargs))
+        if name == "get_cost":
+            cwd = self._c.working_dir or ""
+            if not cwd:
+                return {"error": "No session folder is open; open or attach one first."}
+            from server import cost as cost_mod
+            return await asyncio.to_thread(cost_mod.session_cost, cwd)
         if name in ("git_status", "git_diff"):
             from server import git_ops
             cwd = self._c.working_dir or ""

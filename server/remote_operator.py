@@ -77,7 +77,13 @@ class RemoteOperator:
         except Exception:
             return  # cloud link closed (e.g. out of minutes); run()'s loop handles the end
 
-    async def speak(self, text: str, immediate: bool = False) -> None:
+    async def speak(self, text: str, immediate: bool = False,
+                    dedupe_key: str = "") -> None:
+        # dedupe_key is accepted for signature parity with GeminiOperator (the
+        # multi-session paths pass it for per-session dedupe). The cloud brain
+        # owns dedupe on this metered path, so it is deliberately unused here;
+        # without the parameter every labeled relay raised TypeError and the
+        # foreign-session update was never spoken at all.
         if self._ws is None:
             return
         try:
@@ -95,6 +101,28 @@ class RemoteOperator:
         # Ask the cloud brain not to speak its generic opening (the laptop supplies a
         # contextual one on answer-attach). Sent in-order before the next speak().
         self._suppress_pending = True
+
+    async def open_with_context(self, opening: str, context: str = "") -> None:
+        """The on-answer opening plus the attached session's recent transcript as
+        SILENT background, forwarded to the cloud brain in one frame. Without
+        this the metered path dropped the recap entirely (ws_session falls back
+        to a bare speak when the operator lacks open_with_context), so a cloud
+        call opened knowing only the ring's one-line summary and "what did it
+        actually do?" drew a blank. Tail-capped like GeminiOperator: the newest
+        turns (the last full answer) must survive the cut."""
+        if self._ws is None:
+            return
+        try:
+            if self._suppress_pending:
+                self._suppress_pending = False
+                await self._ws.send(json.dumps({"type": "suppress_greeting"}))
+            await self._ws.send(json.dumps({
+                "type": "open_with_context",
+                "opening": opening,
+                "context": (context or "").strip()[-6000:],
+            }))
+        except Exception:
+            return  # cloud link closed; don't crash the answer flow
 
     async def send_text(self, text: str) -> None:
         # A typed user turn from the phone. Forward it to the cloud brain the same way

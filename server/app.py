@@ -54,6 +54,11 @@ def create_app(config: Config | None = None, operator_factory=None) -> FastAPI:
     from server.device_registry import DeviceRegistry
     from server.call_manager import CallManager
     registry = DeviceRegistry(os.environ.get("VOXA_DEVICES_FILE", "devices.json"))
+    from server.machine_registry import MachineRegistry
+    machines = MachineRegistry(
+        os.environ.get("VOXA_MACHINE_REGISTRY_PATH", "machines.json"),
+        ttl_days=int(os.environ.get("MACHINE_ROSTER_TTL_DAYS", "30")))
+    app.state.machines = machines
     if config.push_enabled:
         from server.apns import ApnsClient
         pusher = ApnsClient(config)
@@ -74,6 +79,15 @@ def create_app(config: Config | None = None, operator_factory=None) -> FastAPI:
     app.state.sessions = sessions
     app.state.notifier = notifier
 
+    from server.prewarm import Prewarmer
+    # Warms the Gemini Live session (and speaks the greeting) while the phone
+    # is still ringing; report() kicks it, serve_ws's claim() adopts it on
+    # answer. Purely an optimization: disabled automatically in proxy mode and
+    # fail-open on any error (see server/prewarm.py's module docstring).
+    prewarmer = Prewarmer(config, operator_factory, notifier, sessions)
+    notifier.prewarmer = prewarmer
+    app.state.prewarmer = prewarmer
+
     from server.session_state import SessionStateFile
     session_state = SessionStateFile()
     app.state.session_state = session_state
@@ -91,7 +105,32 @@ def create_app(config: Config | None = None, operator_factory=None) -> FastAPI:
         return request.query_params.get("token") == config.auth_token
 
     from server.push_routes import add_push_routes
-    add_push_routes(app, registry, call_manager, _check)
+    add_push_routes(app, registry, call_manager, _check, machines=machines)
+    from server.machine_routes import add_machine_routes
+    add_machine_routes(app, machines, _check)
+
+    @app.on_event("startup")
+    async def _machine_heartbeat():
+        import asyncio
+        interval = float(os.environ.get("VOXA_MACHINE_HEARTBEAT_SECONDS", "60"))
+
+        async def _loop():
+            while True:
+                await asyncio.sleep(interval)
+                n = getattr(app.state, "notifier", None)
+                if n is not None:
+                    try:
+                        await n.register_machine_cloud()
+                    except Exception:
+                        logging.exception("machine heartbeat failed")
+
+        app.state.machine_heartbeat = asyncio.ensure_future(_loop())
+
+    @app.on_event("shutdown")
+    async def _stop_machine_heartbeat():
+        t = getattr(app.state, "machine_heartbeat", None)
+        if t is not None:
+            t.cancel()
 
     @app.get("/healthz")
     async def healthz():
@@ -114,7 +153,7 @@ def create_app(config: Config | None = None, operator_factory=None) -> FastAPI:
         try:
             await serve_ws(websocket, config=config, mode=mode, sessions=sessions,
                            notifier=notifier, operator_factory=operator_factory,
-                           session_state=session_state)
+                           session_state=session_state, prewarmer=prewarmer)
         finally:
             notifier.note_client_disconnected()
 

@@ -149,6 +149,19 @@ class ClaudeController:
             if inspect.isawaitable(result):
                 await result
 
+    async def interrupt(self) -> None:
+        """Stop the current generation but KEEP the session (and its context) so
+        follow-ups still work; stop() closes the whole client. The SDK's
+        interrupt() ends the in-flight receive_response stream, so a running
+        send() unwinds on its own."""
+        if self._client is None:
+            return
+        try:
+            await self._client.interrupt()
+        except Exception:
+            logger.exception("SDK interrupt failed")
+        self.status = "idle"
+
     async def stop(self, *, detach_only: bool = False) -> None:
         # detach_only is accepted for a uniform controller interface; the driven SDK
         # session is closed either way (there is no separate terminal to leave running).

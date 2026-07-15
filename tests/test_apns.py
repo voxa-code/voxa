@@ -3,7 +3,8 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from server.apns import build_apns_jwt, build_voip_payload, build_cancel_payload
+from server.apns import (build_apns_jwt, build_voip_payload, build_cancel_payload,
+                         build_alert_payload)
 
 
 # Generate a throwaway P-256 key at runtime (never a real APNs key, and nothing
@@ -47,3 +48,257 @@ def test_voip_payload_includes_approval_only_when_present():
     assert "approval" not in build_voip_payload("c1", "s")
     a = {"approval_id": "abc"}
     assert build_voip_payload("c1", "s", approval=a)["approval"] == a
+
+
+# --- environment fallback: dev (sandbox) tokens vs production config ------------
+
+from server.apns import ApnsClient
+
+
+class _Cfg:
+    apns_key = TEST_P8
+    apns_key_path = ""
+    apns_key_id = "KEY123"
+    apns_team_id = "TEAM45"
+    apns_bundle_id = "space.voxa.app"
+    apns_sandbox = False           # production first (the cloud's config)
+
+
+class _Resp:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+def _make_client(responder):
+    """Patch ApnsClient._post to a scripted responder recording (host, token)."""
+    c = ApnsClient(_Cfg())
+    calls = []
+
+    async def post(client, host, device_token, payload, push_type="voip", topic_suffix=".voip"):
+        calls.append(host)
+        return responder(host)
+    c._post = post
+    return c, calls
+
+
+async def test_send_voip_falls_back_to_sandbox_on_bad_device_token():
+    # A dev build's SANDBOX token against a production-configured cloud: prod
+    # answers 400 BadDeviceToken, the sandbox retry lands the ring.
+    def responder(host):
+        if host == ApnsClient.PROD_HOST:
+            return _Resp(400, '{"reason":"BadDeviceToken"}')
+        return _Resp(200)
+    c, calls = _make_client(responder)
+    assert await c.send_voip("tok1", "c1", "done") is True
+    assert calls == [ApnsClient.PROD_HOST, ApnsClient.SANDBOX_HOST]
+    # The accepting host is remembered: the next push skips the failing round-trip.
+    assert await c.send_voip("tok1", "c2", "done again") is True
+    assert calls[2:] == [ApnsClient.SANDBOX_HOST]
+
+
+async def test_send_voip_no_fallback_on_other_errors():
+    # 410 Gone (dead token) must be returned as-is, not masked by a retry.
+    c, calls = _make_client(lambda host: _Resp(410, '{"reason":"Unregistered"}'))
+    assert await c.send_voip("tok2", "c1", "done") == 410
+    assert calls == [ApnsClient.PROD_HOST]
+
+
+async def test_send_voip_reports_double_bad_device_token_as_dead():
+    # BadDeviceToken from BOTH environments means the token can never work
+    # (stale install or wrong bundle/team): report 410 so the caller prunes it
+    # instead of warning on every single ring forever.
+    c, calls = _make_client(lambda host: _Resp(400, '{"reason":"BadDeviceToken"}'))
+    assert await c.send_voip("tok3", "c1", "done") == 410
+    assert calls == [ApnsClient.PROD_HOST, ApnsClient.SANDBOX_HOST]
+
+
+async def test_cancel_uses_remembered_host():
+    def responder(host):
+        if host == ApnsClient.PROD_HOST:
+            return _Resp(400, '{"reason":"BadDeviceToken"}')
+        return _Resp(200)
+    c, calls = _make_client(responder)
+    await c.send_voip("tok4", "c1", "done")       # learns sandbox
+    assert await c.send_voip_cancel("tok4", "c1") is True
+    assert calls[-1] == ApnsClient.SANDBOX_HOST   # cancel went straight there
+
+
+# --- send_alert (free-tier fallback push) ----------------------------------
+
+def test_alert_payload_shape():
+    p = build_alert_payload("Claude finished", "hi (Voxa Pro would have called you)")
+    assert p["aps"]["alert"]["title"] == "Claude finished"
+    assert p["aps"]["alert"]["body"] == "hi (Voxa Pro would have called you)"
+    assert p["aps"]["sound"] == "default"
+    assert "content-available" not in p["aps"]
+
+
+async def test_send_alert_falls_back_to_sandbox_on_bad_device_token():
+    def responder(host):
+        if host == ApnsClient.PROD_HOST:
+            return _Resp(400, '{"reason":"BadDeviceToken"}')
+        return _Resp(200)
+    c, calls = _make_client(responder)
+    assert await c.send_alert("tok5", "Claude finished", "body") is True
+    assert calls == [ApnsClient.PROD_HOST, ApnsClient.SANDBOX_HOST]
+
+
+async def test_send_alert_returns_status_on_other_errors():
+    c, calls = _make_client(lambda host: _Resp(410, '{"reason":"Unregistered"}'))
+    assert await c.send_alert("tok6", "Claude finished", "body") == 410
+    assert calls == [ApnsClient.PROD_HOST]
+
+
+async def test_send_alert_uses_alert_push_type_and_bare_topic():
+    """The real (unpatched) _post must build alert-specific headers: push-type
+    "alert" and a topic WITHOUT the ".voip" suffix, unlike send_voip."""
+    c = ApnsClient(_Cfg())
+    seen = {}
+
+    class _FakeResp:
+        status_code = 200
+        text = ""
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, content=None):
+            seen["headers"] = headers
+            return _FakeResp()
+
+    import server.apns as apns_module
+    orig = apns_module.httpx.AsyncClient
+    apns_module.httpx.AsyncClient = _FakeAsyncClient
+    try:
+        assert await c.send_alert("tok7", "Claude finished", "body") is True
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+    assert seen["headers"]["apns-push-type"] == "alert"
+    assert seen["headers"]["apns-topic"] == _Cfg.apns_bundle_id  # no ".voip" suffix
+    assert seen["headers"]["apns-priority"] == "10"
+
+
+# --- persistent HTTP/2 connection reuse (A1) --------------------------------
+
+class _FakeAsyncClientRecorder:
+    """Records every construction so tests can assert the client is reused,
+    not rebuilt per push. Mirrors the shape httpx.AsyncClient needs (async
+    context manager methods present but unused by the persistent-client path)."""
+    instances = 0
+
+    def __init__(self, *a, **k):
+        type(self).instances += 1
+        self.is_closed = False
+        self.init_kwargs = k
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def aclose(self):
+        self.is_closed = True
+
+    async def post(self, url, headers=None, content=None):
+        class _R:
+            status_code = 200
+            text = ""
+        return _R()
+
+
+async def test_send_voip_reuses_the_same_client_across_calls():
+    import server.apns as apns_module
+    orig = apns_module.httpx.AsyncClient
+    _FakeAsyncClientRecorder.instances = 0
+    apns_module.httpx.AsyncClient = _FakeAsyncClientRecorder
+    try:
+        c = ApnsClient(_Cfg())
+        await c.send_voip("tokA", "c1", "done")
+        await c.send_voip("tokA", "c2", "done again")
+        # Two pushes must not open two separate httpx.AsyncClient connections.
+        assert _FakeAsyncClientRecorder.instances <= 1
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+
+async def test_post_sends_apns_expiration_zero():
+    """apns-expiration: 0 means a phone that comes online late never rings for
+    a call that already timed out / was superseded."""
+    c = ApnsClient(_Cfg())
+    seen = {}
+
+    class _FakeResp:
+        status_code = 200
+        text = ""
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def post(self, url, headers=None, content=None):
+            seen["headers"] = headers
+            return _FakeResp()
+
+    await c._post(_FakeAsyncClient(), ApnsClient.PROD_HOST, "tokB", {"a": 1})
+    assert seen["headers"]["apns-expiration"] == "0"
+
+
+async def test_aclose_closes_the_shared_client():
+    import server.apns as apns_module
+    orig = apns_module.httpx.AsyncClient
+    apns_module.httpx.AsyncClient = _FakeAsyncClientRecorder
+    try:
+        c = ApnsClient(_Cfg())
+        await c.send_voip("tokC", "c1", "done")
+        client = c._http()
+        assert client.is_closed is False
+        await c.aclose()
+        assert client.is_closed is True
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+
+async def test_send_voip_still_uses_voip_topic_after_refactor():
+    """Guard against the shared _send()/_post() refactor accidentally dropping
+    the ".voip" topic suffix for the original voip push path."""
+    c = ApnsClient(_Cfg())
+    seen = {}
+
+    class _FakeResp:
+        status_code = 200
+        text = ""
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, content=None):
+            seen["headers"] = headers
+            return _FakeResp()
+
+    import server.apns as apns_module
+    orig = apns_module.httpx.AsyncClient
+    apns_module.httpx.AsyncClient = _FakeAsyncClient
+    try:
+        assert await c.send_voip("tok8", "c1", "done") is True
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+    assert seen["headers"]["apns-push-type"] == "voip"
+    assert seen["headers"]["apns-topic"] == f"{_Cfg.apns_bundle_id}.voip"

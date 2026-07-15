@@ -175,6 +175,51 @@ async def test_monitor_announces_when_claude_goes_idle(tmp_path):
     assert spoken and "Yes" in spoken[0]
 
 
+async def test_monitor_holds_working_while_active_marker_shows(tmp_path):
+    # A long thinking stretch renders NO new output: the screen goes stable while
+    # the "esc to interrupt" footer is still up. Status must HOLD "working" and no
+    # mid-task final may fire (the old stability-only check flipped to idle here,
+    # reopening the mic and relaying junk while Claude still worked).
+    fake = FakeTmux(["", "Thinking hard\nesc to interrupt"])  # marker persists
+    spoken = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.005, idle_polls=2)
+    c.on_final(lambda t: spoken.append(t))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.15)
+    assert c.status == "working"
+    assert spoken == []
+    # The marker clears (Claude finished): only now may it settle to idle + announce.
+    fake._caps = ["Thinking hard\nAll done: created index.html"]
+    await asyncio.sleep(0.15)
+    await c.stop()
+    assert c.status == "idle"
+    assert spoken and "All done" in spoken[0]
+
+
+async def test_interrupt_sends_escape_and_keeps_session_driveable(tmp_path):
+    # interrupt() stops the CURRENT generation only: Escape goes to the pane, but
+    # the session, monitor and _started all survive (unlike stop(), which detaches).
+    fake = FakeTmux(["> "])
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.005, idle_polls=2)
+    await c.start(str(tmp_path))
+    c.status = "working"
+    fake.calls.clear()
+    await c.interrupt()
+    assert ["send-keys", "-t", "voxa", "Escape"] in fake.calls
+    assert c._started is True
+    assert c._monitor_task is not None and not c._monitor_task.done()
+    assert c.status == "idle"          # optimistic: ready for a follow-up dispatch
+    assert all(a[0] != "kill-session" for a in fake.calls)
+    await c.stop()
+
+
+async def test_interrupt_before_start_is_a_noop():
+    calls = []
+    c = TmuxController(runner=lambda a: calls.append(list(a)) or "", launch_terminal=False)
+    await c.interrupt()               # not started: nothing sent, no crash
+    assert calls == []
+
+
 async def test_monitor_does_not_announce_on_fresh_boot(tmp_path):
     # A fresh session that just boots to its idle prompt (no work, no prompt) must NOT
     # announce, so starting a session never rings the phone.
@@ -358,6 +403,37 @@ async def test_monitor_loop_streams_live_output_when_hooks_present():
     # with the raw screen at least once.
     assert any("second screen" in o for o in c.outputs)
     assert any("second screen" in o for o in c.color_outputs)
+
+
+async def test_monitor_loop_holds_working_while_active_marker_shows():
+    # Same busy-hold contract as TmuxController._monitor, for the shared loop the
+    # iTerm/Terminal controllers use: a stable screen that still shows the active
+    # marker must NOT settle to idle or emit a mid-task final.
+    screens = ["boot", "Working away\nesc to interrupt"]
+    state = {"i": 0}
+
+    class Ctrl:
+        def __init__(self):
+            self.status = "idle"; self._started = True
+            self._poll = 0.005; self._idle_polls = 2; self.finals = []
+        def _capture(self):
+            i = min(state["i"], len(screens) - 1); state["i"] += 1; return screens[i]
+        async def _emit(self, text): self.finals.append(text)
+
+    c = Ctrl()
+    task = _asyncio.ensure_future(_monitor_loop(c))
+    await _asyncio.sleep(0.1)
+    assert c.status == "working"
+    assert c.finals == []
+    # Marker clears -> the loop may now settle to idle and announce.
+    screens.append("All done here")
+    state["i"] = len(screens) - 1
+    await _asyncio.sleep(0.1)
+    c._started = False
+    await _asyncio.sleep(0.02)
+    task.cancel()
+    assert c.status == "idle"
+    assert any("All done here" in f for f in c.finals)
 
 
 async def test_monitor_loop_without_hooks_still_works():
@@ -665,3 +741,290 @@ async def test_send_serializes_concurrent_sends(monkeypatch):
     assert len(literals) == 2
     between = fake.calls[literals[0] + 1:literals[1]]
     assert any(a and a[-1] == "Enter" for a in between), "sends interleaved (no lock)"
+
+
+async def test_monitor_announces_prompt_with_esc_to_cancel(tmp_path):
+    # An interactive prompt ("Enter to confirm · Esc to cancel") means Claude is
+    # WAITING on the user, not generating: status must settle to idle and the
+    # prompt must be announced. Treating "esc to cancel" as busy suppressed the
+    # announcement and made send_to_claude get busy-refused while a question
+    # sat on screen (caught by the live stop smoke test).
+    fake = FakeTmux(["", "Working\nesc to interrupt",
+                     "Allow this edit?\n> 1. Yes\n  2. No\nEnter to confirm · Esc to cancel"])
+    spoken = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.005, idle_polls=2)
+    c.on_final(lambda t: spoken.append(t))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.2)
+    assert c.status == "idle"                  # waiting on the user, NOT working
+    assert spoken and "allow this edit" in spoken[0].lower()
+    await c.stop()
+
+
+# --- pane_is_generating: busy detection across Claude Code TUI versions ----------
+
+from server.tmux_controller import pane_is_generating
+
+
+def test_pane_is_generating_old_and_new_markers():
+    # Old builds: persistent "esc to interrupt" hint.
+    assert pane_is_generating("stuff\n✶ Crunching… (esc to interrupt)\n") is True
+    assert pane_is_generating("stuff\n  esc to interrupt\n") is True
+    # New builds: glyph spinner line with ellipsis / elapsed timer / running tools.
+    assert pane_is_generating("✳ Protoys, Build and ship prototypes, protoys.app…\n") is True
+    assert pane_is_generating("✻ Reticulating (4s · thinking with high effort)\n") is True
+    assert pane_is_generating("✳ Churned for 2m 25s · 1 shell still running\n") is True
+
+
+def test_pane_is_generating_false_for_idle_and_prompts():
+    # Settled post-turn timing line: glyph but no live suffix.
+    assert pane_is_generating("✻ Crunched for 13s\n> \n") is False
+    # Interactive prompt waiting on the user ("Esc to cancel") is NOT generating.
+    assert pane_is_generating(
+        "Do you trust this folder?\n> 1. Yes\nEnter to confirm · Esc to cancel\n") is False
+    # Plain idle screen.
+    assert pane_is_generating("Here is your answer.\n> \n? for shortcuts\n") is False
+    assert pane_is_generating("") is False
+
+
+# --- interrupt_needs_retry: does the Escape need pressing again? ----------------
+
+from server.tmux_controller import interrupt_needs_retry
+
+
+def test_interrupt_retry_confirmed_interrupt_stops():
+    # "Interrupted" near the bottom = the Escape landed; no retry.
+    now = "42. some poem line\n⎿  Interrupted · What should Claude do instead?\n❯ \n"
+    assert interrupt_needs_retry("whatever", now) is False
+
+
+def test_interrupt_retry_old_interrupt_in_scrollback_does_not_count():
+    # Terminal.app/AX captures include history; an interrupt from a PREVIOUS
+    # turn far above the tail must not read as confirmation of this one.
+    old = "⎿  Interrupted · What should Claude do instead?\n" + "line\n" * 60
+    assert interrupt_needs_retry(old, old + "still streaming") is True
+
+
+def test_interrupt_retry_settled_idle_prompt_stops():
+    idle = "Here is your answer.\n❯ \n⏵⏵ bypass permissions on\n"
+    assert interrupt_needs_retry(idle, idle) is False
+
+
+def test_interrupt_retry_streaming_screen_retries():
+    # Current builds stream with no spinner line, no footer, no prompt: the
+    # screen keeps changing between captures -> press again (vim INSERT mode
+    # ate the first Escape).
+    before = "10. line ten\n11. line eleven\n"
+    now = "11. line eleven\n12. line twelve\n"
+    assert interrupt_needs_retry(before, now) is True
+
+
+def test_interrupt_retry_promptless_static_screen_retries():
+    # Thinking phase: static screen, no prompt, no confirmation -> retry.
+    assert interrupt_needs_retry("screen", "screen") is True
+
+
+def test_interrupt_retry_old_build_generating_marker_retries():
+    gen = "stuff\n✶ Crunching… (esc to interrupt)\n❯ \n"
+    assert interrupt_needs_retry(gen, gen) is True
+
+
+async def test_tmux_interrupt_presses_again_while_streaming(tmp_path):
+    # End-to-end on the controller: pane keeps changing (vim ate Esc #1), so
+    # interrupt() sends Escape again until the pane confirms.
+    panes = iter([
+        "10. ten\n",                         # before-press capture
+        "12. twelve\n",                      # after Esc 1: still streaming
+        "⎿  Interrupted · ok\n❯ \n",          # after Esc 2: confirmed
+    ])
+    sent = []
+
+    def fake(args):
+        if args[0] == "send-keys" and args[-1] == "Escape":
+            sent.append("Esc")
+            return ""
+        if args[0] == "capture-pane":
+            return next(panes, "❯ \n")
+        return ""
+
+    c = TmuxController(runner=fake, launch_terminal=False)
+    c._started = True
+    await c.interrupt()
+    assert sent == ["Esc", "Esc"]
+    assert c.status == "idle"
+
+
+async def test_monitor_holds_working_on_new_style_spinner(tmp_path):
+    # A new-TUI working screen (no "esc to interrupt" anywhere) must still hold
+    # status at working and suppress the mid-task final.
+    fake = FakeTmux(["", "✻ Pondering deeply (12s · thinking with high effort)"])
+    spoken = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.005, idle_polls=2)
+    c.on_final(lambda t: spoken.append(t))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.15)
+    assert c.status == "working"
+    assert spoken == []
+    await c.stop()
+
+
+async def test_default_stuck_seconds_defaults_to_300(monkeypatch):
+    monkeypatch.delenv("VOXA_STUCK_SECONDS", raising=False)
+    from server.tmux_controller import _default_stuck_seconds
+    assert _default_stuck_seconds() == 300.0
+
+
+async def test_default_stuck_seconds_reads_env(monkeypatch):
+    monkeypatch.setenv("VOXA_STUCK_SECONDS", "45")
+    from server.tmux_controller import _default_stuck_seconds
+    assert _default_stuck_seconds() == 45.0
+
+
+async def test_monitor_fires_on_stuck_once_when_pane_never_changes_while_generating(tmp_path):
+    # A pane stuck on the SAME generating screen past VOXA_STUCK_SECONDS fires
+    # on_stuck exactly once for the stretch, not once per poll thereafter.
+    fake = FakeTmux(["", "Thinking hard\nesc to interrupt"])   # repeats forever
+    stuck_calls = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.01,
+                       idle_polls=2, stuck_seconds=0.03)
+    c.on_stuck(lambda elapsed: stuck_calls.append(elapsed))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.3)
+    await c.stop()
+    assert len(stuck_calls) == 1
+    assert stuck_calls[0] >= 0.03
+
+
+async def test_monitor_never_fires_on_stuck_when_pane_keeps_changing(tmp_path):
+    # The pane changes every poll (still generating throughout): each change
+    # resets the stuck timer, so it must never accumulate enough quiet time
+    # to fire, no matter how long the whole stretch runs.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    state = {"i": 0}
+
+    def runner(args):
+        args = list(args)
+        cmd = args[0]
+        if cmd == "has-session":
+            raise RuntimeError("no session")
+        if cmd == "capture-pane":
+            letter = alphabet[state["i"] % len(alphabet)]
+            state["i"] += 1
+            return f"Doing task {letter}\nesc to interrupt"
+        return ""
+
+    stuck_calls = []
+    c = TmuxController(runner=runner, launch_terminal=False, poll_interval=0.01,
+                       idle_polls=2, stuck_seconds=0.03)
+    c.on_stuck(lambda elapsed: stuck_calls.append(elapsed))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.3)
+    await c.stop()
+    assert stuck_calls == []
+
+
+async def test_monitor_never_fires_on_stuck_when_idle_before_threshold(tmp_path):
+    # Claude finishes (goes idle) well before the stuck threshold elapses: a
+    # normal finish must never trigger the stuck alert.
+    fake = FakeTmux(["", "Thinking hard\nesc to interrupt", "All done: task complete"])
+    stuck_calls = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.01,
+                       idle_polls=2, stuck_seconds=5.0)
+    c.on_stuck(lambda elapsed: stuck_calls.append(elapsed))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.2)
+    await c.stop()
+    assert stuck_calls == []
+
+
+async def test_monitor_stuck_disabled_by_zero_seconds(tmp_path):
+    # stuck_seconds=0 (mirrors VOXA_STUCK_SECONDS=0) disables detection outright,
+    # even though the pane is stuck generating well past what would otherwise fire.
+    fake = FakeTmux(["", "Thinking hard\nesc to interrupt"])
+    stuck_calls = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.01,
+                       idle_polls=2, stuck_seconds=0)
+    c.on_stuck(lambda elapsed: stuck_calls.append(elapsed))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.2)
+    await c.stop()
+    assert stuck_calls == []
+
+
+async def test_monitor_stuck_disabled_by_zero_env(tmp_path, monkeypatch):
+    # The env var form (VOXA_STUCK_SECONDS=0) reaches the same disabled state via
+    # the constructor default, without an explicit stuck_seconds= kwarg.
+    monkeypatch.setenv("VOXA_STUCK_SECONDS", "0")
+    fake = FakeTmux(["", "Thinking hard\nesc to interrupt"])
+    stuck_calls = []
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.01, idle_polls=2)
+    c.on_stuck(lambda elapsed: stuck_calls.append(elapsed))
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.2)
+    await c.stop()
+    assert stuck_calls == []
+
+
+async def test_monitor_auto_accepts_trust_prompt_once(tmp_path):
+    # A Voxa-launched session that boots to the folder-trust prompt must be
+    # unstuck automatically (the user already asked to open this folder): ONE
+    # Enter per appearance, not a spam of them while the prompt renders.
+    trust = ("Quick safety check: Is this a project you created or one you trust?\n"
+             "> 1. Yes, I trust this folder\n  2. No, exit\n"
+             "Enter to confirm · Esc to cancel")
+    fake = FakeTmux(["", trust, trust, trust, "> ready\n? for shortcuts"])
+    c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.005, idle_polls=2)
+    await c.start(str(tmp_path))
+    await asyncio.sleep(0.15)
+    await c.stop()
+    enters = [a for a in fake.calls if a == ["send-keys", "-t", "voxa", "Enter"]]
+    assert len(enters) == 1
+
+
+# --- verify_working: the busy guard's verify-on-read (stale flag healing) ----
+
+def _vw_controller():
+    import time as _t
+    from server.tmux_controller import TmuxController
+    c = TmuxController(runner=lambda a: "", launch_terminal=False)
+    c._started = True
+    c.status = "working"
+    c._last_send_at = _t.monotonic()
+    return c
+
+
+async def test_verify_working_trusts_the_grace_window(monkeypatch):
+    monkeypatch.setenv("VOXA_BUSY_GRACE_SECONDS", "60")
+    c = _vw_controller()
+    captures = []
+    c._capture = lambda: captures.append(1) or "irrelevant"
+    assert await c.verify_working() is True
+    assert captures == []          # trusted a fresh send without reading the pane
+    assert c.status == "working"
+
+
+async def test_verify_working_true_while_pane_shows_generation(monkeypatch):
+    monkeypatch.setenv("VOXA_BUSY_GRACE_SECONDS", "0")
+    c = _vw_controller()
+    c._capture = lambda: "output...\n* Crunching (12s - esc to interrupt)\n"
+    assert await c.verify_working() is True
+    assert c.status == "working"
+
+
+async def test_verify_working_heals_a_stale_flag_to_idle(monkeypatch):
+    monkeypatch.setenv("VOXA_BUSY_GRACE_SECONDS", "0")
+    c = _vw_controller()
+    c._capture = lambda: "done.\n> \n"   # idle prompt, no generating marker
+    assert await c.verify_working() is False
+    assert c.status == "idle"
+
+
+async def test_verify_working_fail_safe_when_capture_raises(monkeypatch):
+    monkeypatch.setenv("VOXA_BUSY_GRACE_SECONDS", "0")
+    c = _vw_controller()
+
+    def boom():
+        raise RuntimeError("pane gone")
+    c._capture = boom
+    assert await c.verify_working() is True
+    assert c.status == "working"

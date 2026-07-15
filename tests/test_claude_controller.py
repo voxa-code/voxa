@@ -95,3 +95,29 @@ async def test_send_sets_error_on_exception(tmp_path):
     await c.start(str(tmp_path))
     await c.send("x")
     assert c.status == "error"
+
+
+async def test_interrupt_keeps_client_and_context(tmp_path):
+    # interrupt() stops the current generation via the SDK but KEEPS the session
+    # (and its context) alive, unlike stop() which closes the whole client.
+    class Interruptible(FakeSession):
+        def __init__(self, messages):
+            super().__init__(messages)
+            self.interrupts = 0
+        async def interrupt(self):
+            self.interrupts += 1
+    sess = Interruptible([FakeAssistant("ok"), FakeResult()])
+    c = ClaudeController(session_factory=lambda wd: sess)
+    await c.start(str(tmp_path))
+    await c.interrupt()
+    assert sess.interrupts == 1
+    assert c._client is sess          # session survives an interrupt
+    assert c.status == "idle"
+    await c.send("follow-up")         # still usable afterwards
+    assert sess.queried == "follow-up"
+
+
+async def test_interrupt_without_client_is_a_noop():
+    c = ClaudeController(session_factory=make_factory([]))
+    await c.interrupt()               # no session yet: must not raise
+    assert c.status == "idle"

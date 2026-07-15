@@ -50,13 +50,34 @@ def _scrape_driven_pane(sessions, cwd: str) -> str:
         return ""
 
 
+def _discovery_capture(cwd: str) -> str:
+    """One-shot, read-only capture of ANY open Claude terminal sitting in
+    ``cwd``, not just the driven one: in a fleet, the prompt that fired this
+    Notification usually lives in a terminal Voxa is NOT attached to (yet), and
+    without this the call could only say "needs your permission" with no
+    options. "" on any failure (the caller degrades to the plain summary)."""
+    from server.terminals import find_live_prompt_pane
+    if not (cwd or "").strip():
+        return ""
+    try:
+        found = find_live_prompt_pane(cwd)
+    except Exception:
+        logging.exception("discovery capture for approval failed")
+        return ""
+    return found[1] if found else ""
+
+
 async def _build_approval_for_hook(sessions, notifier, *, cwd: str, msg: str,
                                     session_id: str) -> dict | None:
     """Turn a Notification hook into a structured approval the phone can render
     as buttons, scraping the driven pane in a thread (tmux subprocess calls are
-    blocking). Fail-open: any error here degrades to today's plain report."""
+    blocking); when the prompt lives in a terminal Voxa is not driving, fall
+    back to a read-only discovery capture of the matching terminal. Fail-open:
+    any error here degrades to today's plain report."""
     try:
         pane = await asyncio.to_thread(_scrape_driven_pane, sessions, cwd)
+        if not pane:
+            pane = await asyncio.to_thread(_discovery_capture, cwd)
         if not pane:
             return None
         from server.approvals import build_approval
@@ -76,8 +97,10 @@ def add_hook_routes(app, config, sessions, notifier) -> None:
     from server.ring_policy import RingScheduler, pane_is_busy
 
     # One scheduler per app, closed over by the endpoint; exposed on app.state so
-    # tests can inspect/replace it. Reads VOXA_RING_QUIET_SECONDS at construction.
-    scheduler = RingScheduler(notifier.report)
+    # tests can inspect/replace it. Reads VOXA_RING_QUIET_SECONDS (and, for
+    # instant mode, VOXA_RING_INSTANT/VOXA_RING_CANCEL_WINDOW) at construction.
+    # cancel wires instant mode's stop-the-still-ringing-phone push.
+    scheduler = RingScheduler(notifier.report, cancel=notifier.cancel_ring)
     app.state.ring_scheduler = scheduler
 
     @app.post("/hook")
@@ -88,7 +111,8 @@ def add_hook_routes(app, config, sessions, notifier) -> None:
             body = await request.json()
         except Exception:
             return {"ok": True}
-        from server.hooks import route_hook
+        from server.hooks import (route_hook, pre_tool_deny_response,
+                                  others_mid_turn, drain_held_finishes)
         stand_down_watcher(app, sessions, notifier, hook_cwd=(body or {}).get("cwd", ""))
         # Default 0 = call on EVERY finish. Set VOXA_HOOK_MIN_SECONDS to a positive
         # value to suppress quick interactive turns.
@@ -107,6 +131,14 @@ def add_hook_routes(app, config, sessions, notifier) -> None:
         hook_session = (body or {}).get("session_id", "")
         if event in ("UserPromptSubmit", "PreToolUse"):
             scheduler.note_activity(hook_session)
+        if event == "PreToolUse":
+            # Claude Code is about to run a tool call it decided on its own; if it
+            # is destructive per server.danger, deny it (Claude then asks the user
+            # instead of running it) and rely on the normal Notification hook to
+            # ring when Claude does ask -- no new ring logic here on purpose. A
+            # non-dangerous PreToolUse gets an empty body: no decision implied.
+            deny = pre_tool_deny_response(body or {})
+            return deny if deny is not None else {}
         if msg:
             # Remember WHICH session triggered this call so answering attaches to it
             # and continues that work (instead of opening an empty default session).
@@ -114,19 +146,47 @@ def add_hook_routes(app, config, sessions, notifier) -> None:
             if cwd:
                 sessions.push_pending(cwd)
             if kind == "needs_input":
-                approval = await _build_approval_for_hook(
-                    sessions, notifier, cwd=cwd, msg=msg,
-                    session_id=hook_session)
+                # The pane scrape (_build_approval_for_hook) can sweep every open
+                # terminal via blocking tmux subprocesses before the push goes
+                # out. The approval should still ride the push when the scrape
+                # is fast (the phone renders choices on the call screen), so cap
+                # it with a timeout instead of removing it: a human is already
+                # blocking and must not wait on a slow scrape to hear about it.
+                timeout = float(os.environ.get("VOXA_APPROVAL_SCRAPE_TIMEOUT", "2.0"))
+                build = asyncio.ensure_future(_build_approval_for_hook(
+                    sessions, notifier, cwd=cwd, msg=msg, session_id=hook_session))
+                approval = None
+                try:
+                    approval = await asyncio.wait_for(asyncio.shield(build), timeout)
+                except asyncio.TimeoutError:
+                    # Ring NOW; the scrape keeps running and stores the approval
+                    # for the answer path (fail-open, never blocks the call).
+                    logging.info("approval scrape slow; ringing without options")
+                except Exception:
+                    logging.exception("approval scrape failed; ringing without options")
                 # A human is blocking: ring now, cancelling any pending finish.
                 await scheduler.needs_input(hook_session, msg, cwd, approval=approval)
             else:
                 # A finish: suppress outright if the driven pane shows work still
-                # running (background tasks), else gate behind the quiet window.
+                # running (background tasks); HOLD it while any other tracked
+                # session is still mid-turn (one fleet = one call at the END,
+                # not a "finished" call per session while work is clearly still
+                # going); else gate behind the quiet window. Held finishes are
+                # folded into the ring that finally fires. While a line is open
+                # the report speaks instead of ringing, so nothing is held then.
                 pane = await asyncio.to_thread(_scrape_driven_pane, sessions, cwd)
+                line_open = bool(getattr(notifier.call_manager, "line_open", False))
                 if pane and pane_is_busy(pane):
                     scheduler.note_activity(hook_session)   # clearly still working
                     logging.info("suppressing finish ring: driven pane is busy")
+                elif not line_open and others_mid_turn(
+                        notifier.turn_start, hook_session, time.monotonic()):
+                    notifier.held_finishes[hook_session] = (msg, cwd)
+                    scheduler.note_activity(hook_session)   # no early ring either
+                    logging.info(
+                        "holding finish ring: other sessions still mid-turn")
                 else:
+                    msg = drain_held_finishes(notifier.held_finishes, msg)
                     await scheduler.finish(hook_session, msg, cwd)
         return {"ok": True}
 

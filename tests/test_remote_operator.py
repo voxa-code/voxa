@@ -114,3 +114,37 @@ def test_lang_rides_the_live_proxy_url():
     op = RemoteOperator(object(), None, proxy_url="wss://cloud/live",
                         account="acct1", token="tok", voice="Puck", lang="ar")
     assert "lang=ar" in op._url
+
+
+async def test_speak_accepts_dedupe_key_for_signature_parity():
+    # The multi-session foreign-update path calls speak(..., dedupe_key=cwd) on
+    # WHATEVER operator is live; on the metered path that is RemoteOperator, and
+    # a missing parameter raised TypeError and silenced the update entirely.
+    op = RemoteOperator(object(), None, proxy_url="wss://x/live", account="a")
+    op._ws = FakeWS([])
+    await op.speak("veil finished: tests pass", immediate=True, dedupe_key="/tmp/veil")
+    assert any('"speak"' in s and "veil finished" in s
+               for s in op._ws.sent if isinstance(s, str))
+
+
+async def test_open_with_context_forwards_one_frame_with_tail_capped_context():
+    op = RemoteOperator(object(), None, proxy_url="wss://x/live", account="a")
+    op._ws = FakeWS([])
+    ctx = "OLD-" + "x" * 7000 + "-NEWEST"
+    await op.open_with_context("Hi, you're back in loop.", ctx)
+    frames = [json.loads(s) for s in op._ws.sent if isinstance(s, str)]
+    ows = [f for f in frames if f.get("type") == "open_with_context"]
+    assert len(ows) == 1
+    assert ows[0]["opening"] == "Hi, you're back in loop."
+    assert ows[0]["context"].endswith("-NEWEST")     # tail survives the cap
+    assert "OLD-" not in ows[0]["context"]           # head is what gets cut
+    assert len(ows[0]["context"]) <= 6000
+
+
+async def test_open_with_context_flushes_pending_greeting_suppression_first():
+    op = RemoteOperator(object(), None, proxy_url="wss://x/live", account="a")
+    op._ws = FakeWS([])
+    op.suppress_greeting()
+    await op.open_with_context("Hello.", "some context")
+    types_sent = [json.loads(s).get("type") for s in op._ws.sent if isinstance(s, str)]
+    assert types_sent.index("suppress_greeting") < types_sent.index("open_with_context")

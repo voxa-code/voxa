@@ -22,6 +22,46 @@ def test_format_approval_empty_for_none_and_optionless():
     assert format_approval_for_speech({"summary": "x", "options": []}) == ""
 
 
+# --- FIX 4: name another session's approval in the opening ------------------------
+
+def test_format_approval_names_project_when_it_differs_from_current():
+    approval = {"cwd": "/p/veil", "summary": "continue?",
+                "options": [{"key": "1", "label": "Yes"}]}
+    s = format_approval_for_speech(approval, current_project="loop")
+    assert s.startswith("There's a prompt waiting in veil: continue? ")
+    assert "1: Yes" in s
+
+
+def test_format_approval_names_project_with_no_summary():
+    approval = {"cwd": "/p/veil", "summary": "",
+                "options": [{"key": "1", "label": "Yes"}]}
+    s = format_approval_for_speech(approval, current_project="loop")
+    assert s.startswith("There's a prompt waiting in veil. ")
+
+
+def test_format_approval_unchanged_when_project_matches_current():
+    approval = {"cwd": "/p/loop", "summary": "continue?",
+                "options": [{"key": "1", "label": "Yes"}]}
+    s = format_approval_for_speech(approval, current_project="loop")
+    assert s.startswith("There's a prompt waiting: continue? ")
+    assert "in loop" not in s
+
+
+def test_format_approval_unchanged_when_cwd_missing():
+    approval = {"summary": "continue?", "options": [{"key": "1", "label": "Yes"}]}
+    s = format_approval_for_speech(approval, current_project="loop")
+    assert s.startswith("There's a prompt waiting: continue? ")
+
+
+def test_format_approval_default_current_project_keeps_todays_wording():
+    # Existing single-arg callers keep working; default current_project="" means
+    # any non-empty cwd basename always differs, so the label is named.
+    approval = {"cwd": "/p/loop", "summary": "continue?",
+                "options": [{"key": "1", "label": "Yes"}]}
+    assert format_approval_for_speech(approval).startswith(
+        "There's a prompt waiting in loop: continue? ")
+
+
 def test_compose_opening_appends_the_pending_prompt():
     approval = {"summary": "pick a file", "options": [{"key": "1", "label": "a.py"}]}
     s = compose_opening("loop", ["loop needs input: pick a file"], approval=approval)
@@ -87,3 +127,30 @@ def test_compose_digest_empty_is_blank():
 def test_compose_digest_never_uses_em_dash():
     s = compose_digest("loop", [_done(), _needs(summary="x")])
     assert "—" not in s
+
+
+# --- split_updates_for: opening attribution across sessions ------------------
+
+from server.greetings import split_updates_for
+
+
+def test_split_updates_partitions_by_project_label():
+    own, foreign = split_updates_for("ti0", [
+        "ti0 finished: shipped the feature",
+        "loop finished: built the thing",
+        "adcli needs input: pick an option",
+    ])
+    assert own == ["ti0 finished: shipped the feature"]
+    assert foreign == ["loop finished: built the thing",
+                       "adcli needs input: pick an option"]
+
+
+def test_split_updates_unlabeled_counts_as_own():
+    own, foreign = split_updates_for("ti0", ["All tests green, 42 passing."])
+    assert own == ["All tests green, 42 passing."]
+    assert foreign == []
+
+
+def test_split_updates_without_project_keeps_everything():
+    own, foreign = split_updates_for("", ["loop finished: x"])
+    assert own == ["loop finished: x"] and foreign == []
