@@ -65,6 +65,9 @@ def main() -> int:
     os.environ["VOXA_WATCH_TERMINALS"] = "0"
     os.environ["VOXA_HOOK_MIN_SECONDS"] = "0"
     os.environ["VOXA_DEVICES_FILE"] = os.path.join(tmp, "devices.json")
+    # Ring immediately instead of waiting the production 8s quiet window
+    # (server/ring_policy.py), so this smoke test stays fast.
+    os.environ["VOXA_RING_QUIET_SECONDS"] = "0"
 
     import uvicorn
     from server.app import create_app
@@ -115,7 +118,11 @@ def main() -> int:
             return 1
         print(f"[smoke] call queued: {pending[-1]!r}")
 
-        # 4) Verify the app-OPEN rule: a connected app must NOT queue a call.
+        # 4) Verify the app-OPEN rule: a connected-but-not-on-a-line app must
+        # still queue AND ring (see server/notifier.py's module docstring and
+        # tests/test_app.py::test_hook_still_rings_when_app_open) -- "connected"
+        # just means the terminals-first home screen is open, not that the
+        # finish is being narrated live.
         app.state.notifier.note_client_connected()
         app.state.call_manager._pending.clear()
         subprocess.run(["/bin/sh", "-c", cmd],
@@ -123,10 +130,10 @@ def main() -> int:
                                          "cwd": "/tmp/other", "transcript_path": transcript}),
                        capture_output=True, text=True, timeout=15)
         time.sleep(0.3)
-        if app.state.call_manager._pending:
-            print(f"[smoke] FAIL: app-open should not call. pending={app.state.call_manager._pending!r}")
+        if not app.state.call_manager._pending:
+            print("[smoke] FAIL: app-open (no line) should still ring. pending=[]")
             return 1
-        print("[smoke] app-open correctly did NOT place a call")
+        print(f"[smoke] app-open still rang correctly: {app.state.call_manager._pending[-1]!r}")
 
         ok = True
     finally:

@@ -16,11 +16,13 @@ class MachineRegistry:
     """
 
     def __init__(self, path: str, ttl_days: int = 30,
-                 online_window: float = 120.0, now_fn=time.time):
+                 online_window: float = 120.0, now_fn=time.time,
+                 max_per_account: int = 20):
         self._path = path
         self._ttl = ttl_days * 86400
         self._online_window = online_window
         self._now = now_fn
+        self._max_per_account = max_per_account
         self._by_account: dict[str, dict[str, dict]] = {}
         if os.path.exists(path):
             try:
@@ -59,6 +61,13 @@ class MachineRegistry:
             row["last_seen"] = self._now()
             if name:
                 row["name"] = name
+        # A registered account id is effectively a bearer credential for this
+        # route (see SECURITY.md): without a cap, unlimited distinct
+        # machine_ids can be POSTed forever between TTL prunes. Evict the
+        # stalest entries first so a real roster never gets crowded out.
+        while len(acct) > self._max_per_account:
+            oldest = min(acct, key=lambda mid: acct[mid].get("last_seen", 0))
+            del acct[oldest]
         self._prune()
         self._flush()
 

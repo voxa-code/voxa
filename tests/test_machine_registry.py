@@ -85,3 +85,28 @@ def test_corrupt_file_is_empty(tmp_path):
     p = tmp_path / "machines.json"
     p.write_text("{not json")
     assert MachineRegistry(str(p)).list("acct") == []
+
+
+def test_upsert_caps_machines_per_account_evicting_oldest(tmp_path):
+    clock = [1000.0]
+    r = _reg(tmp_path, now_fn=lambda: clock[0], max_per_account=3)
+    for i in range(3):
+        r.upsert("acct", f"m{i}", f"Mac {i}")
+        clock[0] += 1
+    assert {row["machine_id"] for row in r.list("acct")} == {"m0", "m1", "m2"}
+    r.upsert("acct", "m3", "Mac 3")   # 4th distinct machine: evicts m0 (oldest)
+    ids = {row["machine_id"] for row in r.list("acct")}
+    assert ids == {"m1", "m2", "m3"}
+    assert len(ids) == 3
+
+
+def test_upsert_refresh_of_existing_machine_does_not_evict(tmp_path):
+    clock = [1000.0]
+    r = _reg(tmp_path, now_fn=lambda: clock[0], max_per_account=2)
+    r.upsert("acct", "m1", "A")
+    clock[0] += 1
+    r.upsert("acct", "m2", "B")
+    clock[0] += 1
+    r.upsert("acct", "m1", "A")   # re-registering an existing id, not a new one
+    ids = {row["machine_id"] for row in r.list("acct")}
+    assert ids == {"m1", "m2"}

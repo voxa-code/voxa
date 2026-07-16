@@ -214,7 +214,12 @@ class Notifier:
             payload["approval"] = approval
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=10) as c:
+            # 20s, not 10: this round trip includes the cloud's own APNs push to
+            # Apple, which can be slow on a cold HTTP/2 connection right after a
+            # relay restart. A client-side timeout here is cosmetic (the relay
+            # keeps running the request and still rings), but a needless one
+            # logs a scary traceback for what was actually a successful ring.
+            async with httpx.AsyncClient(timeout=20) as c:
                 await c.post(f"{relay}/notify", json=payload)
         except Exception:
             logging.exception("ring via cloud failed")
