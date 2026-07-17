@@ -20,7 +20,7 @@ import threading
 _CF_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
 # The hosted Voxa Cloud (relay + metered Gemini + push). Non-secret defaults so
-# `voxa` / `npx voxa` runs with ZERO configuration: no key, no token, no .env.
+# `voxa` / `npx voxa-code` runs with ZERO configuration: no key, no token, no .env.
 # The user's keys never touch the laptop; auth is by pairing with the phone app.
 VOXA_DEFAULT_RELAY = "https://api.voxa.space"
 VOXA_DEFAULT_LIVE_PROXY = "wss://api.voxa.space/live"
@@ -244,7 +244,7 @@ def main() -> int:
     if not public_url:
         print(
             "\nCouldn't get a working tunnel after 3 tries (cloudflare quick tunnels\n"
-            "can be flaky). Re-run `npx voxa`, or set up Tailscale for a permanent,\n"
+            "can be flaky). Re-run `voxa`, or set up Tailscale for a permanent,\n"
             "reliable link.\n",
             file=sys.stderr,
         )
