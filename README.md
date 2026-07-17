@@ -26,22 +26,21 @@ See [voxa.space/setup](https://voxa.space/setup) to install and pair your phone.
 
 ## How it works
 
-<img src="assets/how-it-works.svg" width="100%" alt="Speak, the agent works on your laptop, your phone calls you back" />
+<img src="assets/how-it-works.svg" width="560" alt="Speak, the agent works on your laptop, your phone calls you back" />
 
 ## Compatibility
 
-| Platform | Status |
+| | Status |
 |---|---|
-| macOS | Tested |
-| iPhone | Tested |
-| Windows | Available, not yet tested |
-| Android | Not yet |
-
-| Agent | Status |
-|---|---|
-| Claude Code | Working |
-| Codex | Not yet |
-| Gemini | Not yet |
+| **Platforms** | |
+| macOS | ✅ Tested |
+| iPhone | ✅ Tested |
+| Windows | 🟡 Available, not yet tested |
+| Android | ⬜ Not yet |
+| **Agents** | |
+| Claude Code | ✅ Working |
+| Codex | ⬜ Not yet |
+| Gemini | ⬜ Not yet |
 
 ## From source
 
