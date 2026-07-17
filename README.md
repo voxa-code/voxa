@@ -26,10 +26,7 @@ See [voxa.space/setup](https://voxa.space/setup) to install and pair your phone.
 
 ## How it works
 
-<p align="center">
-  <img src="assets/voice.png" width="45%" alt="Speak a task, watch the agent work" />
-  <img src="assets/callback.png" width="45%" alt="Your laptop calls you back when it's done" />
-</p>
+<img src="assets/how-it-works.svg" width="100%" alt="Speak, the agent works on your laptop, your phone calls you back" />
 
 ## Compatibility
 
