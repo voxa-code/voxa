@@ -4,7 +4,7 @@
 
 <h1>Voxa</h1>
 
-<p><strong>Talk to <a href="https://claude.com/claude-code">Claude Code</a> from anywhere.<br/>When it finishes, your phone rings.</strong></p>
+<p><strong>Talk to your AI agent from anywhere.<br/>When it finishes, your phone rings.</strong></p>
 
 [![Website](https://img.shields.io/badge/voxa.space-black?style=flat-square&logo=safari&logoColor=white)](https://voxa.space)
 [![App Store](https://img.shields.io/badge/iPhone-App_Store-0D96F6?style=flat-square&logo=apple&logoColor=white)](https://apps.apple.com/us/app/voxa-code/id6785221351)
@@ -16,75 +16,49 @@
 
 ---
 
-<img src="assets/hero.jpg" width="100%" alt="Voxa on iPhone: your laptop calls you back, a live voice session with Claude, and the agent's terminal streamed to your phone" />
+<img src="assets/hero.jpg" width="100%" alt="Voxa on iPhone: your laptop calls you back, a live voice session with your agent, and its terminal streamed to your phone" />
 
 ---
 
-## Install
+## Get started
 
-Pick your way, same as [voxa.space/setup](https://voxa.space/setup):
-
-**macOS**
-
-```bash
-curl -fsSL https://voxa.space/install.sh | sh
-```
-
-**npm**
-
-```bash
-npm install -g voxa-code
-```
-
-**Python**
-
-```bash
-uv tool install voxa-code
-```
-
-Then run `voxa` on your laptop, scan the QR code with the **[Voxa iOS app](https://apps.apple.com/us/app/voxa-code/id6785221351)** (any phone browser works too), and start talking. Zero config, no API keys: voice runs through the hosted relay, terminal control never leaves your laptop.
-
-**Requires:** [Claude Code](https://claude.com/claude-code) installed and logged in. Tested on macOS and iPhone only for now, see the platforms FAQ below.
+See [voxa.space/setup](https://voxa.space/setup) to install and pair your phone.
 
 ## How it works
 
-- **Speak, don't type.** Pick a project, give instructions, hear results read back, fully hands-free.
-- **Attach any terminal.** iTerm2, Terminal.app, tmux, Ghostty, Warp, VS Code: say "use my open terminal."
-- **It calls you back.** Leave a task running and pocket your phone. When Claude finishes (or needs input), you get a real incoming call. Answer to land in the live session.
+<p align="center">
+  <img src="assets/voice.png" width="45%" alt="Speak a task, watch the agent work" />
+  <img src="assets/callback.png" width="45%" alt="Your laptop calls you back when it's done" />
+</p>
 
-```
-phone ──── voice ────► laptop ────► Claude Code
-  ▲                                     │
-  └───────── rings when done ◄──────────┘
-```
+## Compatibility
+
+| Platform | Status |
+|---|---|
+| macOS | Tested |
+| iPhone | Tested |
+| Windows | Available, not yet tested |
+| Android | Not yet |
+
+| Agent | Status |
+|---|---|
+| Claude Code | Working |
+| Codex | Not yet |
+| Gemini | Not yet |
 
 ## From source
 
-```bash
-git clone https://github.com/voxa-code/voxa.git && cd voxa
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m server.cli
-```
-
-Full guide (including fully self-hosted mode, your own keys, no relay): [docs/RUNNING.md](docs/RUNNING.md)
+Full docs: [voxa.space/docs](https://voxa.space/docs/)
 
 ## FAQ
 
 **Is it open source?**
 
-Everything in this repo is [MIT](LICENSE): the laptop server and the phone web client, everything you need to self-host with your own API key, no account required ([guide](docs/RUNNING.md)). The native iOS app and the hosted relay/push/billing service behind the zero-config install live in separate, proprietary repos, they power the hosted experience but aren't required to run Voxa yourself.
+Everything in this repo is [MIT](LICENSE): the laptop server and the phone web client, everything you need to self-host with your own API key, no account required ([full docs](https://voxa.space/docs/)). The native iOS app and the hosted relay/push/billing service behind the zero-config install live in separate, proprietary repos, they power the hosted experience but aren't required to run Voxa yourself.
 
 **Is it free?**
 
-Self-hosting is free forever: run the server with your own API key, no relay needed ([guide](docs/RUNNING.md)). The hosted zero-config relay is free to get started, with paid plans for more agent minutes ([pricing](https://voxa.space/pricing)).
-
-**What platforms does it support?**
-
-Tested and supported today: the laptop server on macOS, paired with the [Voxa iPhone app](https://apps.apple.com/us/app/voxa-code/id6785221351) (any mobile browser works too). Windows, Linux, and Android are on the roadmap, along with support for other coding agents beyond Claude Code (Codex, etc.). Attaching to already-open GUI terminals (iTerm2, Terminal.app, Ghostty, Warp, VS Code) is macOS only; tmux attach works everywhere the server runs.
-
-## Security
-
-Security model and vulnerability reporting: [SECURITY.md](SECURITY.md)
+Self-hosting is free forever: run the server with your own API key, no relay needed ([full docs](https://voxa.space/docs/)). The hosted zero-config relay is free to get started, with paid plans for more agent minutes ([pricing](https://voxa.space/pricing)).
 
 ---
 
