@@ -1,9 +1,14 @@
 # Publishes the npm package `voxa-code` when a GitHub Release is published.
 #
-# One-time setup (repo owner):
-#   Add a repository secret named NPM_TOKEN containing an npm "Automation"
-#   access token for an account with publish rights to `voxa-code`.
-#   (Settings -> Secrets and variables -> Actions -> New repository secret.)
+# One-time setup (repo owner), on https://www.npmjs.com:
+#   Package Settings -> Trusted Publisher -> add a GitHub Actions publisher
+#   with Organization/user = voxa-code, Repository = voxa,
+#   Workflow filename = publish-npm.yml.
+#   Trusted Publishing (OIDC) needs npm CLI >=11.6.2, hence node-version 24.
+#
+# NPM_TOKEN is kept as a fallback during the OIDC migration window; once a
+# trusted-publisher release has succeeded, drop the NODE_AUTH_TOKEN env var,
+# the always-auth input below, and delete the NPM_TOKEN repo secret.
 name: Publish to npm
 
 on:
@@ -11,10 +16,9 @@ on:
     types: [published]
   workflow_dispatch:
 
-# Least privilege: publishing only needs to read the repo; the npm auth is the
-# NPM_TOKEN secret, not the GITHUB_TOKEN.
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -23,8 +27,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: https://registry.npmjs.org
+          always-auth: true
       - name: Show tarball contents
         run: npm pack --dry-run
       - name: Publish
