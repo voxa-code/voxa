@@ -30,7 +30,7 @@ MARKER = "voxa-hook"
 HOOK_EVENTS = ("Stop", "Notification", "UserPromptSubmit", "PreToolUse")
 
 
-def last_assistant_text(transcript_path: str, max_len: int = 240) -> str:
+def last_assistant_text(transcript_path: str, max_len: int = 500) -> str:
     """Return the last assistant message's text from a Claude transcript JSONL, as a
     short spoken summary. Empty string if unreadable or none found."""
     if not transcript_path or not os.path.exists(transcript_path):
@@ -124,6 +124,22 @@ def route_hook(body: dict, *, turn_start: dict, hook_last: dict, now: float,
         hook_last[session] = now
         summary = (body.get("message") or "").strip()
         msg = f"{label or 'Claude'} needs input" + (f": {summary}" if summary else "")
+        # Claude Code's Notification message is generic ("Claude is waiting for
+        # your input"), but the user answering this ring may have NO screen in
+        # sight: read Claude's actual question (its last transcript message,
+        # which holds the options it just offered) so the call presents the
+        # real choice instead of "what would you like to do?". For permission
+        # prompts the transcript's last message is a tool call, not text, so
+        # fall back to the recorded PreToolUse context: WHICH tool and WHAT it
+        # wants to run is exactly what the user must decide on.
+        question = read_transcript(body.get("transcript_path", ""))
+        if question:
+            msg += f". Claude asked: {question}"
+        elif pre_tool is not None and session in pre_tool:
+            pt = pre_tool[session]
+            tool = pt.get("tool_name") or "a tool"
+            detail = (pt.get("input_summary") or "").strip()
+            msg += f". It wants to run {tool}" + (f": {detail}" if detail else "")
         return msg, "needs_input"
 
     return None, ""

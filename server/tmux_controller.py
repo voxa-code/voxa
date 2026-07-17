@@ -106,7 +106,13 @@ def _make_default_runner(socket: Optional[str]) -> TmuxRunner:
     base = ["tmux"] + (["-L", socket, "-f", "/dev/null"] if socket else [])
 
     def run(args: Sequence[str]) -> str:
-        proc = subprocess.run(base + list(args), capture_output=True, text=True)
+        # Bounded: several callers run on the event loop, and an unbounded hang
+        # on a wedged tmux server froze the whole process (dead websockets).
+        try:
+            proc = subprocess.run(base + list(args), capture_output=True,
+                                  text=True, timeout=10)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"tmux {list(args)} timed out after 10s") from e
         if proc.returncode != 0:
             raise RuntimeError(f"tmux {list(args)} failed: {proc.stderr.strip()}")
         return proc.stdout
@@ -392,9 +398,14 @@ async def monitor_loop(ctrl) -> None:
 
     ``ctrl`` must expose: ``_capture()``, ``_started``, ``_poll``, ``_idle_polls``,
     ``status`` and an async ``_emit(text)``. Used by both the tmux and iTerm controllers.
+
+    Captures run in a worker thread: for the iTerm/Terminal.app/AX backends a
+    capture is an osascript (10s timeout) or Accessibility query that, run on
+    the event loop, froze every websocket in the process (phone line, relay
+    bridge, cloud handshakes) whenever the terminal app was slow to answer.
     """
     try:
-        baseline = ctrl._capture()
+        baseline = await asyncio.to_thread(ctrl._capture)
     except Exception:
         return
     last_key = stable_key(baseline)
@@ -404,7 +415,7 @@ async def monitor_loop(ctrl) -> None:
     while ctrl._started:
         await asyncio.sleep(ctrl._poll)
         try:
-            cur = ctrl._capture()
+            cur = await asyncio.to_thread(ctrl._capture)
         except Exception:
             break  # session gone
         # The generating marker is the authoritative "still working" signal.
@@ -593,9 +604,12 @@ class TmuxController:
         # session (a leftover from a previous run, or a different project) and
         # relaunch claude clean in the requested folder. (Plain phone reconnects do
         # NOT call start(), so a running session still persists across reconnects.)
-        if self._has_session():
+        # In a thread: these subprocess calls run inside serve_ws's answer path,
+        # and the new-session one forks a LOGIN shell (a slow ~/.zshrc blocks it);
+        # on the event loop that froze every websocket in the process.
+        if await asyncio.to_thread(self._has_session):
             try:
-                self._run(["kill-session", "-t", self._session])
+                await asyncio.to_thread(self._run, ["kill-session", "-t", self._session])
             except Exception:
                 pass
         existed = False
@@ -604,7 +618,7 @@ class TmuxController:
             # Launch via a login shell so the user's PATH (e.g. ~/.local/bin) is loaded,
             # and drop back to an interactive shell when claude exits so the window stays.
             shell = os.environ.get("SHELL", "/bin/bash")
-            self._run([
+            await asyncio.to_thread(self._run, [
                 "new-session", "-d", "-s", self._session, "-c", path,
                 "-x", "220", "-y", "50",
                 shell, "-lc", f"{_claude_launch_cmd(resume)}; exec {shell} -il",
@@ -845,9 +859,12 @@ class TmuxController:
     async def _monitor(self) -> None:
         """Watch the pane; when Claude stops changing (finished, or waiting on a
         question/menu/permission prompt), announce the new screen content so the
-        operator can read it to the user and ask what to do."""
+        operator can read it to the user and ask what to do.
+
+        Captures run in a worker thread (see monitor_loop): on-loop subprocess
+        calls froze the process's websockets whenever tmux was slow."""
         try:
-            baseline = self._capture()
+            baseline = await asyncio.to_thread(self._capture)
         except Exception:
             return
         last_key = self._stable_key(baseline)
@@ -865,7 +882,7 @@ class TmuxController:
         while self._started:
             await asyncio.sleep(self._poll)
             try:
-                cur = self._capture()
+                cur = await asyncio.to_thread(self._capture)
             except Exception:
                 break  # session gone
             plain = _ANSI_RE.sub("", cur).lower()
@@ -1001,7 +1018,9 @@ class TmuxController:
         connect before any start(), or a session the user closed): there is
         nothing to re-arm, so _started stays False and send()/press() keep
         degrading to a clean error rather than talking to a dead pane."""
-        if not self._has_session():
+        # In a thread: reattach runs at the top of EVERY phone connection, and a
+        # wedged tmux server on the event loop froze the whole process.
+        if not await asyncio.to_thread(self._has_session):
             return False
         self._started = True
         # A session we merely re-armed (never launched via start()) has no
@@ -1010,7 +1029,7 @@ class TmuxController:
         # Probe the pane's real cwd to fill it in. Fail-open: an empty/failed
         # probe leaves working_dir as-is rather than blanking a known folder.
         if not self.working_dir:
-            path = self._session_path()
+            path = await asyncio.to_thread(self._session_path)
             if path:
                 self.working_dir = path
         if self._monitor_task and not self._monitor_task.done():

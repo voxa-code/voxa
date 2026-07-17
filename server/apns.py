@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -58,13 +59,45 @@ class ApnsClient:
         self._jwt_at = 0
         self._client: httpx.AsyncClient | None = None
 
+    # Hard wall-clock bound on one POST attempt. httpx's own timeout=10 should
+    # fire first; this catches the states it provably does not: a pooled HTTP/2
+    # connection that Apple closed while idle (CLOSE-WAIT) hung /notify forever
+    # in production, so no ring ever went out and nothing was logged.
+    _attempt_timeout = 12.0
+
     def _http(self) -> httpx.AsyncClient:
         """One shared HTTP/2 connection to APNs for the process lifetime.
         Apple throttles rapid connect/disconnect, and a cold TLS handshake
-        adds seconds to trigger-to-ring; reuse is the fix."""
+        adds seconds to trigger-to-ring; reuse is the fix. keepalive_expiry
+        drops a connection idle longer than a minute, BEFORE Apple's idle
+        disconnect can leave a dead-but-pooled connection behind (rings are
+        minutes apart; one ~0.6s handshake per ring is fine)."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(http2=True, timeout=10)
+            self._client = httpx.AsyncClient(
+                http2=True, timeout=10,
+                limits=httpx.Limits(keepalive_expiry=60))
         return self._client
+
+    async def _post_recovering(self, host: str, device_token: str, payload: dict,
+                                push_type: str = "voip", topic_suffix: str = ".voip"):
+        """POST once on the shared client; on a timeout or transport error assume
+        the pooled connection is dead, rebuild the client, and retry once on a
+        fresh connection. A second failure propagates to the caller (which logs
+        it), so a push can hang for at most ~2 attempts, never forever."""
+        try:
+            return await asyncio.wait_for(
+                self._post(self._http(), host, device_token, payload,
+                           push_type, topic_suffix),
+                self._attempt_timeout)
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            logger.warning(
+                "APNs %s push attempt failed on the shared connection (%s: %s); "
+                "retrying on a fresh connection", push_type, type(e).__name__, e)
+            await self.aclose()
+            return await asyncio.wait_for(
+                self._post(self._http(), host, device_token, payload,
+                           push_type, topic_suffix),
+                self._attempt_timeout)
 
     async def aclose(self) -> None:
         if self._client is not None and not self._client.is_closed:
@@ -114,14 +147,13 @@ class ApnsClient:
         Returns True on success, or the HTTP status code on failure (so the
         caller can prune a 410 Gone / dead token)."""
         host = self._token_host.get(device_token, self._host)
-        client = self._http()
-        resp = await self._post(client, host, device_token, payload, push_type, topic_suffix)
+        resp = await self._post_recovering(host, device_token, payload, push_type, topic_suffix)
         if resp.status_code == 200:
             self._token_host[device_token] = host
             return True
         if resp.status_code == 400 and "BadDeviceToken" in resp.text:
             other = self._other_host(host)
-            retry = await self._post(client, other, device_token, payload, push_type, topic_suffix)
+            retry = await self._post_recovering(other, device_token, payload, push_type, topic_suffix)
             if retry.status_code == 200:
                 self._token_host[device_token] = other
                 logger.info("APNs %s push ok on %s after BadDeviceToken on %s "
@@ -162,12 +194,11 @@ class ApnsClient:
     async def send_voip_cancel(self, device_token: str, call_id: str) -> bool:
         payload = build_cancel_payload(call_id)
         host = self._token_host.get(device_token, self._host)
-        client = self._http()
-        resp = await self._post(client, host, device_token, payload)
+        resp = await self._post_recovering(host, device_token, payload)
         if resp.status_code == 200:
             return True
         if resp.status_code == 400 and "BadDeviceToken" in resp.text:
-            retry = await self._post(client, self._other_host(host),
-                                     device_token, payload)
+            retry = await self._post_recovering(self._other_host(host),
+                                                device_token, payload)
             return retry.status_code == 200
         return False

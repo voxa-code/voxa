@@ -75,6 +75,37 @@ def test_unregister_removes_token(tmp_path, monkeypatch):
     assert client.post("/unregister", json={"token": "AA"}).status_code == 200
     assert "AA" not in app.state.registry.tokens()
 
+
+def _await_captured(captured, key, tries=300):
+    """The answer path now hops to worker threads (reattach/capture), so the
+    factory call is scheduled rather than synchronous with the first audio
+    byte; hold the socket open until it lands instead of racing it."""
+    import time as _time
+    for _ in range(tries):
+        if key in captured:
+            return
+        _time.sleep(0.01)
+
+
+import contextlib as _ctx
+
+
+@_ctx.contextmanager
+def _tolerant_ws(client, url):
+    """websocket_connect whose EXIT swallows the app task's cancellation.
+
+    Closing the client can cancel serve_ws while it is mid worker-thread hop
+    (attach/discovery); the portal then reports the task future as cancelled
+    at context exit. These tests assert on the captured factory params, not
+    on a graceful shutdown, so the teardown outcome is irrelevant here."""
+    cm = client.websocket_connect(url)
+    ws = cm.__enter__()
+    try:
+        yield ws
+    finally:
+        with _ctx.suppress(BaseException):
+            cm.__exit__(None, None, None)
+
 def test_voice_param_reaches_factory(tmp_path, monkeypatch):
     monkeypatch.setenv("VOXA_DEVICES_FILE", str(tmp_path / "devices.json"))
     captured = {}
@@ -84,8 +115,9 @@ def test_voice_param_reaches_factory(tmp_path, monkeypatch):
         yield FakeOperator(config, handle)
     cfg = Config("k", "m", "secret", "127.0.0.1", 8787)
     client = TestClient(create_app(cfg, operator_factory=cap_factory))
-    with client.websocket_connect("/ws?token=secret&voice=Kore") as ws:
+    with _tolerant_ws(client, "/ws?token=secret&voice=Kore") as ws:
         ws.send_bytes(b"\x00")
+        _await_captured(captured, "voice")
     assert captured.get("voice") == "Kore"
 
 def test_account_param_reaches_factory(tmp_path, monkeypatch):
@@ -99,8 +131,9 @@ def test_account_param_reaches_factory(tmp_path, monkeypatch):
         yield FakeOperator(config, handle)
     cfg = Config("k", "m", "secret", "127.0.0.1", 8787)
     client = TestClient(create_app(cfg, operator_factory=cap_factory))
-    with client.websocket_connect("/ws?token=secret&account=user-77") as ws:
+    with _tolerant_ws(client, "/ws?token=secret&account=user-77") as ws:
         ws.send_bytes(b"\x00")
+        _await_captured(captured, "account")
     assert captured.get("account") == "user-77"
 
 def test_session_gated_until_begin(tmp_path, monkeypatch):
@@ -1890,6 +1923,7 @@ def test_lang_param_reaches_factory(tmp_path, monkeypatch):
         yield FakeOperator(config, handle)
     cfg = Config("k", "m", "secret", "127.0.0.1", 8787)
     client = TestClient(create_app(cfg, operator_factory=cap_factory))
-    with client.websocket_connect("/ws?token=secret&lang=ar") as ws:
+    with _tolerant_ws(client, "/ws?token=secret&lang=ar") as ws:
         ws.send_bytes(b"\x00")
+        _await_captured(captured, "lang")
     assert captured.get("lang") == "ar"

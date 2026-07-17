@@ -149,10 +149,17 @@ async def serve_ws(websocket: WebSocket, *, config, mode: str, sessions, notifie
     activity = {"t": time.monotonic()}
     def touch(): activity["t"] = time.monotonic()
 
+    # Turn-latency probe: monotonic time of the LAST user-speech transcript
+    # chunk; the first audio bytes after it close the turn and log the gap
+    # (generation + tools + transport). Diagnostic only.
+    _turn = {"t0": 0.0}
+
     async def speak(text): await operator.speak(text)
     async def notify(msg):
         if isinstance(msg, dict) and msg.get("type") == "transcript":
             touch()
+            if msg.get("role") == "user":
+                _turn["t0"] = time.monotonic()
             # Voice history: the user's half of the session, recorded so past
             # sessions can be replayed on the phone. Fail-open by contract.
             try:
@@ -202,15 +209,14 @@ async def serve_ws(websocket: WebSocket, *, config, mode: str, sessions, notifie
     if "lang" in inspect.signature(operator_factory).parameters:
         _kwargs["lang"] = _lang
     # Remember who's paired so the background watcher can ring this account's
-    # phone (via the cloud) when a terminal finishes while they're away.
+    # phone (via the cloud) when a terminal finishes while they're away, and so
+    # a background prewarm (kicked from notifier.report while THIS connection
+    # may not even exist yet) opens its operator with the same account/voice/
+    # lang the phone will ask for again on the next answer. Persisted, so a
+    # fresh `voxa` run prewarms with the right identity before any reconnect.
+    notifier.remember_phone(_account, voice, _lang)
     if _account:
-        notifier.last_account = _account
         asyncio.ensure_future(notifier.register_machine_cloud())
-    # Remember voice/lang too: a background prewarm (kicked from notifier.report
-    # while THIS connection may not even exist yet) needs the same operator
-    # config the phone will ask for again on the next answer.
-    notifier.last_voice = voice
-    notifier.last_lang = _lang
 
     # Pre-session gate: do NOT open the (metered) /live voice session until the
     # user taps Start ("begin") or starts talking. Until then we only do FREE
@@ -295,6 +301,10 @@ async def serve_ws(websocket: WebSocket, *, config, mode: str, sessions, notifie
     async with operator_cm as operator:
         async def audio_out(pcm):
             touch()  # Gemini is speaking -> the line is active
+            if _turn["t0"]:
+                _log.info("turn latency: %.2fs (last user words -> first reply audio)",
+                          time.monotonic() - _turn["t0"])
+                _turn["t0"] = 0.0
             _counts["out"] += 1
             if _counts["out"] % 50 == 1:
                 _log.info("ws: sent %d audio chunks -> phone", _counts["out"])

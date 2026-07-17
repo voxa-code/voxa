@@ -83,8 +83,9 @@ class _PassiveWatch:
             return
         # Don't report "done" if Claude is still working (stable screen but a
         # spinner/"esc to interrupt" is showing) -> avoids calling before the task
-        # actually finishes.
-        screen = self._capture().lower()
+        # actually finishes. In a thread: this is an osascript for the iTerm/
+        # Terminal.app backends, which on the event loop froze the process.
+        screen = (await asyncio.to_thread(self._capture)).lower()
         if any(m in screen for m in self._WORKING_MARKERS):
             return
         self._saw_work = False
@@ -181,7 +182,8 @@ class TerminalWatcher:
             return
         elapsed = 0.0
         while elapsed < self._resume_window:
-            screen = (self._capture_session(session) or "").lower()
+            screen = ((await asyncio.to_thread(self._capture_session, session))
+                      or "").lower()
             if any(m in screen for m in _PassiveWatch._WORKING_MARKERS):
                 result = self._on_resumed(session.get("label", ""), session.get("cwd", ""))
                 if inspect.isawaitable(result):

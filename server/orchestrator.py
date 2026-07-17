@@ -832,6 +832,18 @@ class Orchestrator:
         return await self._start(cwd, resume=stem or None)
 
     async def handle_tool_call(self, name: str, args: dict) -> dict:
+        # Timed: a tool round-trip sits INSIDE the user's turn (Gemini answers
+        # only after it returns), so slow tools read as "Voxa takes seconds to
+        # respond". The log makes that share of turn latency visible.
+        import time as _time
+        _t0 = _time.monotonic()
+        try:
+            return await self._handle_tool_call(name, args)
+        finally:
+            logging.getLogger("voxa").info(
+                "tool %s took %.2fs", name, _time.monotonic() - _t0)
+
+    async def _handle_tool_call(self, name: str, args: dict) -> dict:
         if name in ("start_claude_session", "set_working_dir"):
             key = "working_dir" if name == "start_claude_session" else "path"
             return await self._start(args.get(key, ""))

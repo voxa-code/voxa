@@ -28,7 +28,8 @@ from server.notify_rules import NotifyRules
 class Notifier:
     def __init__(self, call_manager, push_enabled: bool,
                  ring_debounce: float | None = None,
-                 rules: NotifyRules | None = None):
+                 rules: NotifyRules | None = None,
+                 phone_state_path: str = ""):
         self._cm = call_manager
         self._push_enabled = push_enabled
         if ring_debounce is None:
@@ -48,6 +49,22 @@ class Notifier:
         # a phone has connected at least once.
         self.last_voice = ""
         self.last_lang = ""
+        # Persist who's paired (account/voice/lang) so a fresh `voxa` run rings
+        # and prewarms with the RIGHT identity before the phone reconnects.
+        # Without this, the first ring after every laptop restart prewarmed with
+        # no account, which in metered mode meant a doomed /live session and a
+        # cold (slow) answer. Empty path (tests) = no persistence.
+        self._phone_state_path = phone_state_path
+        if phone_state_path:
+            try:
+                import json
+                with open(phone_state_path) as f:
+                    saved = json.load(f)
+                self.last_account = str(saved.get("account", "") or "")
+                self.last_voice = str(saved.get("voice", "") or "")
+                self.last_lang = str(saved.get("lang", "") or "")
+            except (OSError, ValueError):
+                pass
         # Set by app.py to a Prewarmer sharing this notifier/sessions/config, so
         # report() can kick it the instant a ring fires. None (the default) keeps
         # report() a no-op on this front, e.g. in tests that build a bare Notifier.
@@ -107,6 +124,32 @@ class Notifier:
 
     def note_client_disconnected(self) -> None:
         self.phone_clients = max(0, self.phone_clients - 1)
+
+    def remember_phone(self, account: str, voice: str, lang: str) -> None:
+        """Record (and persist, when a path was given) the connecting phone's
+        identity/config. Voice/lang always follow the newest connection; the
+        account only updates when non-empty, so a browser client without one
+        never wipes the paired phone's id. Fail-open on any disk error."""
+        if account:
+            self.last_account = account
+        self.last_voice = voice
+        self.last_lang = lang
+        if not self._phone_state_path:
+            return
+        try:
+            import json
+            d = os.path.dirname(self._phone_state_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = self._phone_state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"account": self.last_account,
+                           "voice": self.last_voice,
+                           "lang": self.last_lang}, f)
+            os.replace(tmp, self._phone_state_path)
+        except OSError:
+            logging.getLogger("voxa").warning(
+                "could not persist phone state to %s", self._phone_state_path)
 
     async def report(self, summary: str, *, kind: str = "finish", cwd: str = "",
                       approval: dict | None = None) -> None:

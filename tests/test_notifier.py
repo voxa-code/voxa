@@ -378,3 +378,37 @@ async def test_report_line_open_on_update_speak_failure_is_swallowed():
     n.on_update_speak = boom
     await n.report("veil finished", cwd="/p/veil")   # must not raise
     assert cm.queued == [] and cm.updates == []
+
+
+def test_remember_phone_persists_and_reloads(tmp_path):
+    # A fresh `voxa` run must ring/prewarm with the SAME identity the phone
+    # last paired with, not wait for it to reconnect. remember_phone persists;
+    # a new Notifier with the same path starts pre-populated.
+    path = str(tmp_path / "phone.json")
+    n = Notifier(_FakeCM(), push_enabled=True, phone_state_path=path)
+    n.remember_phone("acct-42", "Kore", "ar")
+    n2 = Notifier(_FakeCM(), push_enabled=True, phone_state_path=path)
+    assert n2.last_account == "acct-42"
+    assert n2.last_voice == "Kore"
+    assert n2.last_lang == "ar"
+
+
+def test_remember_phone_empty_account_keeps_paired_one(tmp_path):
+    # A browser client (no account param) must not wipe the paired phone's id,
+    # but its voice/lang choice still applies to the next warm.
+    path = str(tmp_path / "phone.json")
+    n = Notifier(_FakeCM(), push_enabled=True, phone_state_path=path)
+    n.remember_phone("acct-42", "Kore", "")
+    n.remember_phone("", "Puck", "ar")
+    assert n.last_account == "acct-42"
+    assert n.last_voice == "Puck" and n.last_lang == "ar"
+    n2 = Notifier(_FakeCM(), push_enabled=True, phone_state_path=path)
+    assert n2.last_account == "acct-42"
+
+
+def test_remember_phone_without_path_is_memory_only(tmp_path):
+    # Tests and bare Notifiers (no path) must keep working with zero disk IO.
+    n = Notifier(_FakeCM(), push_enabled=True)
+    n.remember_phone("acct-1", "Kore", "")
+    assert n.last_account == "acct-1"
+    assert list(tmp_path.iterdir()) == []

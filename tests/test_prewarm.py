@@ -219,3 +219,45 @@ async def test_stale_slot_is_discarded_on_claim(monkeypatch):
     monkeypatch.undo()
     await _settle()
     assert ops[0].exited
+
+
+async def test_start_skipped_in_proxy_mode_without_account(monkeypatch):
+    # Metered mode with no paired account known (fresh `voxa` run, phone never
+    # connected this process): a warm session would open under a fallback
+    # identity the answering phone can never match, burning metered minutes
+    # for nothing. It must not even build an operator.
+    monkeypatch.setenv("VOXA_LIVE_PROXY", "wss://cloud.example/live")
+    notifier = _FakeNotifier(voice="Kore", lang="", account="")
+    ops: list[_FakeWarmOperator] = []
+    pw = Prewarmer(None, _factory(ops), notifier, sessions=None)
+    await pw.start("loop finished: done", "/p/x", None)
+    assert ops == []
+    assert pw.claim("Kore", "", "") is None
+
+
+async def test_start_proceeds_in_proxy_mode_with_account(monkeypatch):
+    monkeypatch.setenv("VOXA_LIVE_PROXY", "wss://cloud.example/live")
+    notifier = _FakeNotifier(voice="Kore", lang="", account="acct1")
+    ops: list[_FakeWarmOperator] = []
+    pw = Prewarmer(None, _factory(ops), notifier, sessions=None)
+    await pw.start("loop finished: done", "/p/x", None)
+    try:
+        assert len(ops) == 1
+        assert ops[0].account == "acct1"
+    finally:
+        await _cleanup(pw)
+
+
+async def test_start_without_account_still_warms_in_direct_mode(monkeypatch):
+    # Direct (own-key) mode has no metering and no per-account identity to
+    # mismatch on the operator itself; the first-ever answer should still get
+    # a warm greeting.
+    monkeypatch.delenv("VOXA_LIVE_PROXY", raising=False)
+    notifier = _FakeNotifier(voice="Kore", lang="", account="")
+    ops: list[_FakeWarmOperator] = []
+    pw = Prewarmer(None, _factory(ops), notifier, sessions=None)
+    await pw.start("loop finished: done", "/p/x", None)
+    try:
+        assert len(ops) == 1
+    finally:
+        await _cleanup(pw)

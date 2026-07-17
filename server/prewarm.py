@@ -151,6 +151,13 @@ class Prewarmer:
         voice = getattr(self._notifier, "last_voice", "") or ""
         lang = getattr(self._notifier, "last_lang", "") or ""
         account = getattr(self._notifier, "last_account", "") or ""
+        if not account and os.environ.get("VOXA_LIVE_PROXY", "").strip():
+            # Metered mode with no paired account known: the warm session would
+            # open under a fallback identity the answering phone can never match
+            # (claim() would discard it), burning metered minutes for nothing.
+            # Skip; the cold path covers the first-ever answer.
+            logger.info("prewarm skipped: no paired account known yet (metered mode)")
+            return
         key = (voice, lang, account)
 
         # `slot` is assigned below, AFTER the operator (and therefore this

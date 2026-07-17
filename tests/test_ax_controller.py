@@ -88,8 +88,10 @@ async def test_ax_screenfull_streams_output_and_scrollback():
     c.on_output(lambda t: outputs.append(t))
     await c.start()
     # let the monitor loop's own baseline capture run before we move the screen on,
-    # so the later poll actually observes a change (it is scheduled, not synchronous).
-    await asyncio.sleep(0)
+    # so the later poll actually observes a change. The capture now runs in a
+    # worker thread (so a slow AX query can't freeze the event loop), which needs
+    # real time, not just one loop turn.
+    await asyncio.sleep(0.05)
     # advance the capturer so the screen "changes"
     state["i"] = 1
     await asyncio.sleep(0.15)

@@ -312,3 +312,37 @@ def test_drain_held_finishes_combines_and_clears():
 
 def test_drain_held_finishes_noop_when_nothing_held():
     assert drain_held_finishes({}, "loop finished") == "loop finished"
+
+
+def test_notification_reads_claudes_actual_question(tmp_path):
+    # The user answering this ring may have NO screen in sight: after the
+    # generic notification text, the ring must carry Claude's actual question
+    # (its last transcript message holds the options it just offered), so the
+    # call presents the real choice instead of "what would you like to do?".
+    t = tmp_path / "t.jsonl"
+    t.write_text('{"type":"assistant","message":{"role":"assistant","content":'
+                 '"The disk erase was blocked. Should I (1) skip it or (2) run it anyway?"}}\n')
+    msg, kind = route_hook(
+        {"hook_event_name": "Notification", "session_id": "s9", "cwd": "/p/loop",
+         "message": "Claude is waiting for your input", "transcript_path": str(t)},
+        turn_start={}, hook_last={}, now=50.0)
+    assert kind == "needs_input"
+    assert "Claude asked:" in msg
+    assert "skip it" in msg and "run it anyway" in msg
+
+
+def test_notification_falls_back_to_pending_tool_context(tmp_path):
+    # Permission prompts leave no trailing TEXT in the transcript (the last
+    # message is a tool call), so the ring must at least say WHICH tool and
+    # WHAT it wants to run; that is the decision the user is being asked for.
+    t = tmp_path / "t.jsonl"
+    t.write_text("")  # no assistant text to read
+    pre = {"s10": {"tool_name": "Bash",
+                   "input_summary": "{'command': 'make deploy'}"}}
+    msg, kind = route_hook(
+        {"hook_event_name": "Notification", "session_id": "s10", "cwd": "/p/ti",
+         "message": "Claude needs your permission to use Bash",
+         "transcript_path": str(t)},
+        turn_start={}, hook_last={}, now=60.0, pre_tool=pre)
+    assert kind == "needs_input"
+    assert "It wants to run Bash" in msg and "make deploy" in msg

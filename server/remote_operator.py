@@ -45,14 +45,17 @@ class RemoteOperator:
         self._stack = contextlib.AsyncExitStack()
 
     async def __aenter__(self) -> "RemoteOperator":
-        # The cloud /live can briefly refuse mid-deploy/restart; retry a few times with
-        # a longer handshake timeout so a momentary blip doesn't drop the session.
+        # The cloud /live can briefly refuse mid-deploy/restart; retry a few times.
+        # open_timeout is 8s, not 20: the phone speaks its local fallback at ~10s
+        # and gives up entirely at ~25s of dead air, so one slow handshake must
+        # fail fast enough to leave the retries a chance inside that window
+        # (worst case here is ~4x(8+1.5) ~= 38s, down from ~86s).
         last_err: Exception | None = None
         for attempt in range(4):
             try:
                 self._ws = await self._stack.enter_async_context(
                     websockets.connect(self._url, max_size=None,
-                                       ping_interval=20, open_timeout=20))
+                                       ping_interval=20, open_timeout=8))
                 return self
             except Exception as e:
                 last_err = e

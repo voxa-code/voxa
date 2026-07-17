@@ -206,7 +206,11 @@ class AXController:
                 await result
 
     async def start(self, working_dir: Optional[str] = None) -> None:
-        if not self._trusted():
+        # Both AX calls below run in a thread: Accessibility queries against a
+        # busy terminal app can take seconds with no timeout, and on the event
+        # loop (this runs inside serve_ws's answer path) that froze every
+        # websocket in the process.
+        if not await asyncio.to_thread(self._trusted):
             self._opener(_AX_SETTINGS_URL)
             raise PermissionError(
                 f"{AX_PERMISSION_ERROR}: grant Accessibility permission to the "
@@ -218,7 +222,7 @@ class AXController:
         self.status = "idle"
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
-        first = self._capture()
+        first = await asyncio.to_thread(self._capture)
         self.mirrors_screen = bool(first.strip())
         if self.mirrors_screen:
             self._monitor_task = asyncio.ensure_future(monitor_loop(self))

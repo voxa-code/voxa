@@ -268,6 +268,86 @@ async def test_aclose_closes_the_shared_client():
         apns_module.httpx.AsyncClient = orig
 
 
+# --- dead pooled connection recovery -----------------------------------------
+# Regression: Apple closed the idle shared HTTP/2 connection (CLOSE-WAIT) and
+# every push awaited it forever; /notify hung >90s with nothing logged and no
+# ring ever went out (production, 2026-07-17). A push attempt must be bounded
+# and retried once on a fresh client.
+
+
+class _HangThenOkClient:
+    """First instance's post() hangs forever; later instances answer 200.
+    Mimics the dead pooled APNs connection + the healthy fresh one."""
+    instances = 0
+
+    def __init__(self, *a, **k):
+        type(self).instances += 1
+        self._hang = type(self).instances == 1
+        self.is_closed = False
+
+    async def aclose(self):
+        self.is_closed = True
+
+    async def post(self, url, headers=None, content=None):
+        if self._hang:
+            import asyncio
+            await asyncio.Event().wait()   # never set: hangs like CLOSE-WAIT
+        class _R:
+            status_code = 200
+            text = ""
+        return _R()
+
+
+async def test_send_voip_recovers_from_a_hung_pooled_connection():
+    import server.apns as apns_module
+    orig = apns_module.httpx.AsyncClient
+    _HangThenOkClient.instances = 0
+    apns_module.httpx.AsyncClient = _HangThenOkClient
+    try:
+        c = ApnsClient(_Cfg())
+        c._attempt_timeout = 0.05      # don't make the test wait 12 real seconds
+        assert await c.send_voip("tokH", "c1", "done") is True
+        # The hung client was dropped and a fresh one made the successful push.
+        assert _HangThenOkClient.instances == 2
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+
+async def test_send_voip_recovers_from_a_transport_error():
+    import httpx as _httpx
+    import server.apns as apns_module
+
+    class _RaiseThenOkClient(_HangThenOkClient):
+        async def post(self, url, headers=None, content=None):
+            if self._hang:
+                raise _httpx.ConnectError("connection reset")
+            return await super().post(url, headers=headers, content=content)
+
+    orig = apns_module.httpx.AsyncClient
+    _RaiseThenOkClient.instances = 0
+    apns_module.httpx.AsyncClient = _RaiseThenOkClient
+    try:
+        c = ApnsClient(_Cfg())
+        assert await c.send_voip("tokE", "c1", "done") is True
+        assert _RaiseThenOkClient.instances == 2
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+
+async def test_shared_client_sets_a_keepalive_expiry():
+    """An idle pooled connection must expire client-side before Apple's idle
+    disconnect can leave a dead-but-pooled connection behind."""
+    import server.apns as apns_module
+    orig = apns_module.httpx.AsyncClient
+    apns_module.httpx.AsyncClient = _FakeAsyncClientRecorder
+    try:
+        c = ApnsClient(_Cfg())
+        limits = c._http().init_kwargs.get("limits")
+        assert limits is not None and limits.keepalive_expiry == 60
+    finally:
+        apns_module.httpx.AsyncClient = orig
+
+
 async def test_send_voip_still_uses_voip_topic_after_refactor():
     """Guard against the shared _send()/_post() refactor accidentally dropping
     the ".voip" topic suffix for the original voip push path."""

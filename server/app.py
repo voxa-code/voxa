@@ -32,8 +32,16 @@ def _default_operator_factory(config, handle_tool_call, voice="", account="", la
     if proxy:
         from server.remote_operator import RemoteOperator
         # Account precedence: the paired phone's id (per-connection) wins, so each
-        # phone meters its own balance; fall back to env/auth_token for solo runs.
-        acct = account or os.environ.get("VOXA_ACCOUNT", "") or config.auth_token
+        # phone meters its own balance; VOXA_ACCOUNT pins one for solo runs; else a
+        # stable per-machine anonymous device account (same `d-` convention as the
+        # app pre-sign-in). NEVER the auth token: token-as-account minted a parallel
+        # free-trial identity that silently burned out, after which every /live
+        # connect was refused -> no Gemini audio -> the phone fell back to its
+        # local voice (and the secret token leaked into billing records).
+        acct = account or os.environ.get("VOXA_ACCOUNT", "").strip()
+        if not acct:
+            from server.machine_id import machine_id
+            acct = f"d-{machine_id()}"
         return RemoteOperator(
             config, handle_tool_call, proxy_url=proxy, account=acct,
             token=os.environ.get("VOXA_PROXY_TOKEN", ""), voice=voice, lang=lang)
@@ -75,15 +83,19 @@ def create_app(config: Config | None = None, operator_factory=None) -> FastAPI:
     from server.notifier import Notifier
     from server.session import SessionRegistry
     sessions = SessionRegistry()
-    notifier = Notifier(call_manager, push_enabled=config.push_enabled)
+    notifier = Notifier(call_manager, push_enabled=config.push_enabled,
+                        phone_state_path=os.environ.get(
+                            "VOXA_PHONE_STATE_FILE",
+                            os.path.expanduser("~/.voxa/phone.json")))
     app.state.sessions = sessions
     app.state.notifier = notifier
 
     from server.prewarm import Prewarmer
     # Warms the Gemini Live session (and speaks the greeting) while the phone
     # is still ringing; report() kicks it, serve_ws's claim() adopts it on
-    # answer. Purely an optimization: disabled automatically in proxy mode and
-    # fail-open on any error (see server/prewarm.py's module docstring).
+    # answer. Purely an optimization, fail-open on any error. Runs in proxy
+    # mode too (shorter TTL there since the warm session is metered), but only
+    # once a paired account is known (see server/prewarm.py).
     prewarmer = Prewarmer(config, operator_factory, notifier, sessions)
     notifier.prewarmer = prewarmer
     app.state.prewarmer = prewarmer
