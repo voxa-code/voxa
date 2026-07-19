@@ -16,7 +16,10 @@
 
 ---
 
-<img src="assets/hero.jpg" width="100%" alt="Voxa on iPhone: your laptop calls you back, a live voice session with your agent, and its terminal streamed to your phone" />
+
+
+https://github.com/user-attachments/assets/2e66f49c-ae3c-4b41-a5e6-0ad34e2f62c0
+
 
 ---
 
