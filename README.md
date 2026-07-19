@@ -8,7 +8,7 @@
 
 [![Website](https://img.shields.io/badge/voxa.space-black?style=flat-square&logo=safari&logoColor=white)](https://voxa.space)
 [![App Store](https://img.shields.io/badge/iPhone-App_Store-0D96F6?style=flat-square&logo=apple&logoColor=white)](https://apps.apple.com/us/app/voxa-code/id6785221351)
-[![npm](https://img.shields.io/npm/v/voxa-code?style=flat-square&label=npm&color=CB3837)](https://www.npmjs.com/package/voxa-code)
+[![npm](https://img.shields.io/badge/npm-voxa--code-CB3837?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/voxa-code)
 [![PyPI](https://img.shields.io/pypi/v/voxa-code?style=flat-square&label=PyPI&color=3775A9)](https://pypi.org/project/voxa-code/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
