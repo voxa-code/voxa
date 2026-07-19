@@ -237,6 +237,52 @@ async def test_set_working_dir_error_suggests_siblings(tmp_path):
     assert "alpha" in res["suggestions"] and "beta" in res["suggestions"]
 
 
+async def test_start_tmux_not_installed_returns_say_without_suggestions(tmp_path):
+    # A missing tool (tmux) is not a bad-path problem: folder suggestions would
+    # mislead the model into inventing a workaround instead of relaying the "say"
+    # field verbatim-ish (the tmux-missing confabulation this whole fix targets).
+    class NoTmuxController(FakeController):
+        async def start(self, wd):
+            raise RuntimeError(
+                "tmux_not_installed: tmux was not found on this Mac. "
+                "Install it with: brew install tmux")
+
+    orch, _, _, _ = make(NoTmuxController())
+    res = await orch.handle_tool_call(
+        "start_claude_session", {"working_dir": str(tmp_path)})
+    assert res["error"] == "tmux_not_installed"
+    assert "say" in res and "brew install tmux" in res["say"]
+    assert "searched_in" not in res and "suggestions" not in res
+
+
+async def test_start_other_runtime_error_has_no_suggestions_either():
+    # Any other unexpected exception (not the bad-path ValueError) must return a
+    # plain error, never the searched_in/suggestions pair meant for a wrong folder.
+    class BoomController(FakeController):
+        async def start(self, wd):
+            raise RuntimeError("terminal failed to open")
+
+    orch, _, _, _ = make(BoomController())
+    res = await orch.handle_tool_call("start_claude_session", {"working_dir": "/tmp"})
+    assert res == {"error": "terminal failed to open"}
+
+
+async def test_start_bad_path_still_suggests_siblings(tmp_path):
+    # The ValueError (bad-path) branch keeps today's recovery behavior.
+    (tmp_path / "alpha").mkdir()
+
+    class FailController(FakeController):
+        async def start(self, wd):
+            raise ValueError("nope")
+
+    orch, _, _, _ = make(FailController())
+    res = await orch.handle_tool_call(
+        "start_claude_session", {"working_dir": str(tmp_path / "ghost")})
+    assert res["error"] == "nope"
+    assert res["searched_in"] == str(tmp_path)
+    assert "alpha" in res["suggestions"]
+
+
 async def test_list_dirs(tmp_path):
     (tmp_path / "x").mkdir()
     orch, _, _, _ = make()
@@ -981,6 +1027,54 @@ async def test_new_session_bad_path_suggests_siblings(tmp_path):
     assert "alpha" in res["suggestions"] and "beta" in res["suggestions"]
     assert len(reg.all()) == 2           # nothing was created
     assert orch.controller is a          # nothing swapped
+
+
+async def test_new_session_tmux_not_installed_returns_say_without_suggestions(
+        tmp_path, monkeypatch):
+    # Same failure-kind differentiation as start_claude_session: a missing tmux
+    # is not a bad-path problem, so no searched_in/suggestions, just the "say"
+    # field the model should read back instead of confabulating a workaround.
+    a = FleetController(str(tmp_path / "alpha"), "voxa-a")
+    reg = SessionRegistry()
+    reg.add(Session("aid", a, QuietHub(), call_manager=None))
+    reg.set_active("aid")
+    orch, _, spoken, ui = make(a)
+    orch.sessions = reg
+
+    class NoTmux:
+        def __init__(self, session_name="voxa", launch_terminal=True,
+                     terminal_app="auto", **kw):
+            self._session = session_name
+            self.status = "idle"
+            self.working_dir = None
+        def on_final(self, cb): pass
+        async def start(self, wd=None):
+            raise RuntimeError(
+                "tmux_not_installed: tmux was not found on this Mac. "
+                "Install it with: brew install tmux")
+        async def stop(self, *, detach_only=False): pass
+
+    import server.tmux_controller as tc
+    monkeypatch.setattr(tc, "TmuxController", NoTmux)
+    monkeypatch.setattr(tc, "pick_session_name",
+                        lambda sid, cwd=None, **k: f"voxa-{sid}")
+
+    class FakeNotifier:
+        hooks_live = False
+        call_manager = object()
+    orch.notifier = FakeNotifier()
+
+    proj = tmp_path / "gamma"
+    proj.mkdir()
+    res = await orch.handle_tool_call("new_session", {"path": str(proj)})
+    assert res["error"] == "tmux_not_installed"
+    assert "say" in res and "brew install tmux" in res["say"]
+    assert "searched_in" not in res and "suggestions" not in res
+    # Rollback still happened: the previous session is restored and drivable.
+    assert len(reg.all()) == 1
+    assert reg.active_id == "aid"
+    assert orch.controller is a
+    assert a.reattach_calls == 1 and a._started is True
 
 
 async def test_fleet_tools_without_registry_report_error():

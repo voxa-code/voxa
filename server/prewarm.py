@@ -247,14 +247,22 @@ class Prewarmer:
         try:
             slot = self._slot
             if slot is None:
+                logger.info("prewarm miss: nothing warm (no ring, or start skipped)")
                 return None
             self._slot = None   # detach either way; a rejected slot is torn down below
             stale = time.monotonic() - slot.created_at > _ttl_seconds()
             mismatched = slot.key != (voice, lang, account)
             dead = slot.run_task is not None and slot.run_task.done()
             if stale or mismatched or dead:
+                reason = ("stale" if stale else
+                          f"key mismatch (warm={slot.key!r} vs answer={(voice, lang, account)!r})"
+                          if mismatched else "session died during the ring")
+                logger.info("prewarm miss: %s; cold path takes over", reason)
                 asyncio.ensure_future(self._discard_slot(slot))
                 return None
+            logger.info("prewarm: adopted warm session (greeting buffered %.1fs ago, "
+                        "%d audio chunks ready)", time.monotonic() - slot.created_at,
+                        len(slot.audio))
             return slot
         except Exception:
             logger.exception("prewarm claim failed; cold path takes over")

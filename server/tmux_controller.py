@@ -113,6 +113,13 @@ def _make_default_runner(socket: Optional[str]) -> TmuxRunner:
                                   text=True, timeout=10)
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"tmux {list(args)} timed out after 10s") from e
+        except FileNotFoundError as e:
+            # A fresh Mac (install.sh only guarantees uv + voxa-code) has no tmux;
+            # without this, subprocess.run raises a raw FileNotFoundError("'tmux'")
+            # that bubbles up as an unreadable crash instead of an actionable error.
+            raise RuntimeError(
+                "tmux_not_installed: tmux was not found on this Mac. "
+                "Install it with: brew install tmux") from e
         if proc.returncode != 0:
             raise RuntimeError(f"tmux {list(args)} failed: {proc.stderr.strip()}")
         return proc.stdout
@@ -594,10 +601,18 @@ class TmuxController:
         """Launch (kill+relaunch) the driven claude session in ``working_dir``.
         An optional ``resume`` stem launches ``claude --resume <stem>`` so a past
         conversation is reopened; an unsafe stem is dropped in _claude_launch_cmd."""
+        # Check BEFORE anything else: a fresh Mac (install.sh only guarantees uv +
+        # voxa-code) has no tmux, and the runner's own FileNotFoundError guard only
+        # fires once a tmux subprocess is actually attempted. Failing fast here with
+        # the same actionable message keeps every caller (server + tests) consistent
+        # regardless of which tmux invocation would have hit the missing binary first.
+        if shutil.which("tmux") is None:
+            raise RuntimeError(
+                "tmux_not_installed: tmux was not found on this Mac. "
+                "Install it with: brew install tmux")
         path = os.path.abspath(os.path.expanduser(working_dir))
         if not os.path.isdir(path):
             raise ValueError(f"not a directory: {working_dir}")
-        self.working_dir = path
         self.status = "idle"
 
         # An explicit "open/start a session" ALWAYS starts fresh: kill any existing
@@ -623,6 +638,10 @@ class TmuxController:
                 "-x", "220", "-y", "50",
                 shell, "-lc", f"{_claude_launch_cmd(resume)}; exec {shell} -il",
             ])
+        # Only recorded once new-session actually succeeds: setting it earlier made
+        # get_claude_status report a live-looking working_dir even after a failed
+        # start (e.g. tmux missing, or the new-session command raising).
+        self.working_dir = path
         self._started = True
 
         # Open a terminal window so the user can SEE the session. Open it when we

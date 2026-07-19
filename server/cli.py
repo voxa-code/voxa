@@ -127,14 +127,23 @@ def main() -> int:
     port = cfg.port
     relay_url = os.environ.get("VOXA_RELAY_URL", "").strip()
 
-    if not relay_url and not _which("cloudflared"):
+    # cloudflared is only REQUIRED when neither a relay URL nor Tailscale is
+    # available: Tailscale being installed and logged in leaves VOXA_RELAY_URL
+    # unset (see _apply_zero_config_defaults) so it can take the direct
+    # tailscale-serve path below (~line 208), which needs no tunnel at all. The
+    # old check ignored that and exited demanding cloudflared even when
+    # Tailscale alone would have worked.
+    if not relay_url and not _tailscale_available() and not _which("cloudflared"):
         print(
             "cloudflared is not installed. Install it with:\n"
             "  brew install cloudflared\n"
-            "(or set VOXA_RELAY_URL to your hosted relay).",
+            "(or set VOXA_RELAY_URL to your hosted relay, or install/log into "
+            "Tailscale for a stable direct link instead).",
             file=sys.stderr,
         )
         return 1
+
+    _preflight()
 
     if _port_in_use(port):
         print(
@@ -266,6 +275,43 @@ def main() -> int:
 def _which(name: str) -> bool:
     from shutil import which
     return which(name) is not None
+
+
+def _claude_cli_available() -> bool:
+    """Is the `claude` CLI reachable? Checked via the user's LOGIN shell, not this
+    process's own PATH: `uv tool`/pipx-style envs run with a different PATH than
+    the user's interactive shell (missing ~/.local/bin, nvm's node, etc.), so a
+    bare shutil.which('claude') here can false-negative even when `claude` works
+    fine in a normal Terminal window."""
+    shell = os.environ.get("SHELL", "/bin/sh")
+    try:
+        r = subprocess.run([shell, "-lc", "command -v claude"],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _preflight() -> None:
+    """Warn (never block startup) about tools a Claude session needs but
+    install.sh does not guarantee: a fresh Mac only ships with uv + voxa-code.
+    Printed once here so the FIRST time the user asks Voxa to open a folder,
+    they've already seen why it might fail, instead of the voice model
+    confabulating an excuse (TmuxController.start's tmux_not_installed error is
+    now clear, but a warning at launch is cheaper for the user than a failed call)."""
+    if not _which("tmux"):
+        print(
+            "\n  tmux is not installed; Claude sessions can't start without it.\n"
+            "  Install it with: brew install tmux\n",
+            file=sys.stderr,
+        )
+    if not _claude_cli_available():
+        print(
+            "\n  Claude Code (the `claude` CLI) was not found.\n"
+            "  Install it with: npm install -g @anthropic-ai/claude-code\n"
+            "  or see https://docs.anthropic.com/en/docs/claude-code/setup\n",
+            file=sys.stderr,
+        )
 
 
 def _tailscale_available() -> bool:

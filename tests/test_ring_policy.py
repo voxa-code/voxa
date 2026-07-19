@@ -180,10 +180,10 @@ async def test_instant_mode_needs_input_after_finish_never_cancels_and_still_rep
     assert [c["kind"] for c in r.calls] == ["finish", "needs_input"]
 
 
-async def test_default_mode_finish_still_waits_for_the_quiet_window(monkeypatch):
-    # Instant mode is opt-in: with the env unset, finish() must keep today's
-    # behavior of waiting behind a pending task instead of reporting right away.
-    monkeypatch.delenv("VOXA_RING_INSTANT", raising=False)
+async def test_opt_out_finish_still_waits_for_the_quiet_window(monkeypatch):
+    # Instant mode is the DEFAULT now; an explicit VOXA_RING_INSTANT=0 must
+    # restore the original behavior of waiting behind a pending task.
+    monkeypatch.setenv("VOXA_RING_INSTANT", "0")
     r = Recorder()
     s = RingScheduler(r.report, quiet_seconds=0.05)
     await s.finish("sess1", "done", "/p/loop")
@@ -281,3 +281,15 @@ def test_looks_like_error_misses_normal_prose():
     assert not looks_like_error("This function handles error recovery gracefully")
     assert not looks_like_error("All 10 tests passed, no failures")
     assert not looks_like_error("Let's terraform the error handling module")
+
+
+def test_instant_ring_is_the_default(monkeypatch):
+    # The product default is INSTANT ring (a finish rings immediately; the
+    # cancel window covers false positives). Only an explicit
+    # VOXA_RING_INSTANT=0 restores the quiet-window behavior.
+    monkeypatch.delenv("VOXA_RING_INSTANT", raising=False)
+    s = RingScheduler(lambda *a, **k: None)
+    assert s._instant is True
+    monkeypatch.setenv("VOXA_RING_INSTANT", "0")
+    s2 = RingScheduler(lambda *a, **k: None)
+    assert s2._instant is False

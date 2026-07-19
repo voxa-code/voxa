@@ -65,7 +65,12 @@ function getTokenFromUrl() {
 
 function buildWsUrl(token) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+  let url = `${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`;
+  // Through the hosted relay the phone leg is matched to the laptop by the
+  // pairing code from the QR URL; the local server just ignores it.
+  const code = new URLSearchParams(window.location.search).get('code');
+  if (code) url += `&code=${encodeURIComponent(code)}`;
+  return url;
 }
 
 function wsOpen() {

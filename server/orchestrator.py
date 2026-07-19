@@ -800,10 +800,25 @@ class Orchestrator:
     async def _start(self, working_dir: str, resume: str | None = None) -> dict:
         try:
             await self._launch(working_dir, resume)
-        except Exception as e:
-            # Help the user recover from a wrong spoken path with suggestions.
+        except RuntimeError as e:
+            # A missing tool (tmux not installed) is not a bad-path problem, so
+            # folder suggestions would be misleading; give the model something it
+            # can read back verbatim instead, and tell it not to improvise a
+            # workaround (this is what used to produce the "I'm running into an
+            # issue with tmux, but I can still work in the Desktop folder" confabulation).
+            msg = str(e)
+            if msg.startswith("tmux_not_installed"):
+                return {"error": "tmux_not_installed",
+                        "say": "tmux isn't installed on this Mac, so I can't start "
+                               "sessions yet. On the laptop, run: brew install tmux, "
+                               "then ask me again."}
+            return {"error": msg}
+        except ValueError as e:
+            # A bad spoken folder path: help the user recover with suggestions.
             base, options = suggest_dirs(working_dir)
             return {"error": str(e), "searched_in": base, "suggestions": options}
+        except Exception as e:
+            return {"error": str(e)}
         await self._notify({"type": "status", "working_dir": self._c.working_dir})
         # If the visible terminal window couldn't be opened, tell the user how to
         # attach manually instead of leaving them with an invisible session.
@@ -1055,9 +1070,20 @@ class Orchestrator:
                 # True) cleared its _started); re-arm it so the restored session is
                 # drivable again instead of degrading to no_session on the next send.
                 await self._reattach(prev_controller)
-                base, options = suggest_dirs(path)
-                return {"error": str(e),
-                        "searched_in": base, "suggestions": options}
+                # Differentiate failure kinds the same way _start does: a missing
+                # tool is not a bad-path problem (folder suggestions would mislead
+                # the model into confabulating a workaround), so give it a plain,
+                # model-legible error instead.
+                msg = str(e)
+                if isinstance(e, RuntimeError) and msg.startswith("tmux_not_installed"):
+                    return {"error": "tmux_not_installed",
+                            "say": "tmux isn't installed on this Mac, so I can't "
+                                   "start sessions yet. On the laptop, run: "
+                                   "brew install tmux, then ask me again."}
+                if isinstance(e, ValueError):
+                    base, options = suggest_dirs(path)
+                    return {"error": msg, "searched_in": base, "suggestions": options}
+                return {"error": msg}
             await self._notify({"type": "status",
                                 "working_dir": controller.working_dir or path})
             await self.push_sessions()

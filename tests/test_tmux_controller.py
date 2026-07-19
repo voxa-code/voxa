@@ -150,6 +150,49 @@ def test_open_terminal_returns_false_when_all_fail(monkeypatch):
     assert c._open_terminal() is False
 
 
+async def test_start_raises_tmux_not_installed_when_missing(tmp_path, monkeypatch):
+    # A fresh Mac (install.sh only guarantees uv + voxa-code) has no tmux: start()
+    # must fail fast with an actionable RuntimeError instead of a raw
+    # FileNotFoundError("'tmux'") bubbling out of subprocess.run.
+    import server.tmux_controller as tc
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    fake = FakeTmux(["> "])
+    c = TmuxController(runner=fake, launch_terminal=False)
+    try:
+        await c.start(str(tmp_path))
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert str(e).startswith("tmux_not_installed")
+        assert "brew install tmux" in str(e)
+    # Nothing was recorded as a live session, and no tmux command was even attempted.
+    assert c.working_dir is None
+    assert c._started is False
+    assert fake.calls == []
+
+
+async def test_start_leaves_working_dir_unset_when_new_session_fails(tmp_path):
+    # working_dir must reflect an ACTUAL running session: a failed new-session
+    # (any tmux error) must not leave get_claude_status reporting a live-looking
+    # folder for a session that never started.
+    class BoomTmux:
+        def __call__(self, args):
+            args = list(args)
+            if args[0] == "has-session":
+                raise RuntimeError("no session")
+            if args[0] == "new-session":
+                raise RuntimeError("tmux new-session failed: boom")
+            return ""
+
+    c = TmuxController(runner=BoomTmux(), launch_terminal=False)
+    try:
+        await c.start(str(tmp_path))
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert c.working_dir is None
+    assert c._started is False
+
+
 async def test_start_creates_session_and_send_injects_keys(tmp_path):
     fake = FakeTmux(["> "])
     c = TmuxController(runner=fake, launch_terminal=False, poll_interval=0.005, idle_polls=2)

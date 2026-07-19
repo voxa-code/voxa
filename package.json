@@ -1,6 +1,6 @@
 {
   "name": "voxa-code",
-  "version": "0.1.106",
+  "version": "0.1.108",
   "description": "Voxa: a hands-free voice line to Claude Code. Run `npx voxa-code` to start the server, open a tunnel, and print a QR to pair your phone.",
   "bin": { "voxa": "bin/voxa.js" },
   "scripts": {

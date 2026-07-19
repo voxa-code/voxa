@@ -13,12 +13,13 @@ one calls the phone a dozen times for one task. Policy:
   the finish outright; the final Stop after the last agent has no marker.
 Fail-open: errors inside a delayed ring are logged, never raised into /hook.
 
-Instant mode (VOXA_RING_INSTANT=1) trades the quiet window for latency: finish
-rings the phone right away instead of waiting to see if the session keeps
-going. To cover for the false positives that trade-off invites, any same-
-session hook activity that arrives within a short cancel window
-(VOXA_RING_CANCEL_WINDOW, default 15s) after that ring fires a cancel push
-that stops the still-ringing (or, harmlessly, already-answered) phone.
+Instant mode (the DEFAULT; set VOXA_RING_INSTANT=0 to disable) trades the
+quiet window for latency: finish rings the phone right away instead of
+waiting to see if the session keeps going. To cover for the false positives
+that trade-off invites, any same-session hook activity that arrives within a
+short cancel window (VOXA_RING_CANCEL_WINDOW, default 15s) after that ring
+fires a cancel push that stops the still-ringing (or, harmlessly,
+already-answered) phone.
 """
 from __future__ import annotations
 
@@ -63,7 +64,13 @@ class RingScheduler:
         # default) keeps instant mode's cancel step a no-op, e.g. in tests
         # that only care about the immediate-ring half of the behavior.
         self._cancel = cancel
-        self._instant = os.environ.get("VOXA_RING_INSTANT", "").strip().lower() in ("1", "true")
+        # Instant mode is the DEFAULT (set VOXA_RING_INSTANT=0 to restore the
+        # quiet-window behavior): a finish rings the phone immediately, and the
+        # cancel window below covers the false positives (same-session activity
+        # right after the ring stops the still-ringing phone). ~8s faster
+        # finish-to-ring at the cost of an occasional self-cancelling ring.
+        self._instant = (os.environ.get("VOXA_RING_INSTANT", "1").strip().lower()
+                         not in ("0", "false", ""))
         self._cancel_window = float(os.environ.get("VOXA_RING_CANCEL_WINDOW", "15"))
         # session_id -> monotonic time of an instant-mode finish ring, so a
         # LATER note_activity can tell "this session just rang, and might not
